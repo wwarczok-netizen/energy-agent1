@@ -249,7 +249,9 @@ def npf_irr(values, guess=0.1):
 def optimize_variants(df, annual_yield, params, min_sc=80.0):
     rows = []
     pv_sizes = np.arange(params["pv_min_kwp"], params["pv_max_kwp"] + 1, params["pv_step_kwp"])
-    bess_sizes = [0, 250, 500, 750, 1000, 1500, 2000]
+    bess_step = max(50, int(params.get("opt_bess_step_kwh", 250)))
+    bess_max = max(0, int(params.get("opt_bess_max_kwh", 2000)))
+    bess_sizes = list(range(0, bess_max + 1, bess_step))
     peak_target = params["peak_target_kw"]
     for pv in pv_sizes:
         for cap in bess_sizes:
@@ -276,6 +278,22 @@ with st.sidebar:
     bess_power = st.number_input("Moc BESS [kW]", 0, 10000, 500, 50)
     bess_eff = st.slider("Sprawność round-trip BESS [%]", 70, 98, 90)
     peak_target = st.number_input("Cel peak shaving — moc po redukcji [kW]", 0, 10000, 1000, 10)
+
+    st.subheader("Optimizer — automatyczny dobór")
+    optimizer_goal = st.selectbox(
+        "Cel optymalizacji",
+        [
+            "Najwyższy cash flow netto",
+            "Najwyższy ROI",
+            "Najniższy eksport po BESS",
+            "Największy peak shaving",
+        ],
+    )
+    opt_pv_min = st.number_input("Optimizer: PV od [kWp]", 10, 10000, 500, 50)
+    opt_pv_max = st.number_input("Optimizer: PV do [kWp]", 10, 10000, 2000, 50)
+    opt_pv_step = st.number_input("Optimizer: krok PV [kWp]", 10, 1000, 100, 10)
+    opt_bess_max = st.number_input("Optimizer: BESS do [kWh]", 0, 20000, 2000, 250)
+    opt_bess_step = st.number_input("Optimizer: krok BESS [kWh]", 50, 5000, 250, 50)
 
     st.subheader("Założenia finansowe")
     energy_price = st.number_input("Energia czynna [PLN/MWh]", 0, 3000, 500, 10)
@@ -310,9 +328,11 @@ params = {
     "debt_share_pct": debt_share,
     "debt_years": debt_years,
     "analysis_years": analysis_years,
-    "pv_min_kwp": 100,
-    "pv_max_kwp": int(max(100, pv_kwp * 1.8)),
-    "pv_step_kwp": 100,
+    "pv_min_kwp": int(opt_pv_min),
+    "pv_max_kwp": int(max(opt_pv_min, opt_pv_max)),
+    "pv_step_kwp": int(opt_pv_step),
+    "opt_bess_max_kwh": int(opt_bess_max),
+    "opt_bess_step_kwh": int(opt_bess_step),
     "bess_power_kw": bess_power,
     "bess_eff_pct": bess_eff,
     "peak_target_kw": peak_target,
@@ -441,14 +461,53 @@ fig3 = px.imshow(heat, labels=dict(x="Dzień tygodnia", y="Godzina", color="Śr.
 fig3.update_yaxes(autorange="reversed")
 st.plotly_chart(fig3, use_container_width=True)
 
-st.subheader("Optymalizacja wariantów")
-st.caption("Testuje siatkę PV oraz BESS. Priorytet: spełnienie 80% autokonsumpcji i najwyższy roczny cash flow netto. Bez arbitrażu.")
-if st.button("Policz ranking wariantów"):
-    with st.spinner("Liczenie wariantów..."):
+st.subheader("Automatyczny dobór PV + BESS")
+st.caption("Optimizer testuje siatkę wariantów i wybiera konfigurację spełniającą cel min. 80% autokonsumpcji. Bez arbitrażu — BESS ładuje się z nadwyżki PV i pracuje pod self-consumption oraz peak shaving.")
+
+goal_to_col = {
+    "Najwyższy cash flow netto": ("net_cash_pln", False),
+    "Najwyższy ROI": ("roi_pct", False),
+    "Najniższy eksport po BESS": ("export_after_bess_mwh", True),
+    "Największy peak shaving": ("peak_reduction_kw", False),
+}
+
+if st.button("Policz rekomendację i ranking wariantów"):
+    with st.spinner("Liczenie wariantów PV+BESS..."):
         ranking = optimize_variants(df, annual_yield, params, min_sc=80.0)
-    show_cols = ["PV kWp", "BESS kWh", "BESS kW", "autokonsumpcja_pct", "export_potential_mwh", "export_after_bess_mwh", "peak_reduction_kw", "annual_benefit_pln", "capex_pln", "roi_pct", "irr_pct", "dscr", "spełnia 80% SC"]
-    st.dataframe(ranking[show_cols].head(30), use_container_width=True)
-    st.download_button("Pobierz ranking CSV", ranking.to_csv(index=False).encode("utf-8-sig"), "ranking_pv_bess.csv", "text/csv")
+
+    eligible = ranking[ranking["spełnia 80% SC"]].copy()
+    if eligible.empty:
+        st.error("Żaden wariant w zadanym zakresie nie spełnia celu 80% autokonsumpcji. Zwiększ zakres BESS albo zmniejsz zakres PV.")
+        eligible = ranking.copy()
+
+    sort_col, ascending = goal_to_col[optimizer_goal]
+    recommended = eligible.sort_values(sort_col, ascending=ascending).iloc[0]
+
+    st.success(f"Rekomendacja wg celu: {optimizer_goal}")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("PV", f"{recommended['PV kWp']:.0f} kWp")
+    c2.metric("BESS", f"{recommended['BESS kWh']:.0f} kWh / {recommended['BESS kW']:.0f} kW")
+    c3.metric("Autokonsumpcja", f"{recommended['autokonsumpcja_pct']:.1f}%")
+    c4.metric("Eksport po BESS", f"{recommended['export_after_bess_mwh']:.0f} MWh")
+    c5.metric("Peak shaving", f"{recommended['peak_reduction_kw']:.0f} kW")
+    c6.metric("ROI", f"{recommended['roi_pct']:.1f}%")
+
+    show_cols = ["PV kWp", "BESS kWh", "BESS kW", "autokonsumpcja_pct", "export_potential_mwh", "export_after_bess_mwh", "peak_reduction_kw", "annual_benefit_pln", "net_cash_pln", "capex_pln", "roi_pct", "irr_pct", "dscr", "spełnia 80% SC"]
+
+    top = eligible.sort_values(sort_col, ascending=ascending).head(20)
+    fig_opt = px.scatter(
+        top,
+        x="PV kWp",
+        y="BESS kWh",
+        size="annual_benefit_pln",
+        color="autokonsumpcja_pct",
+        hover_data=["roi_pct", "irr_pct", "dscr", "peak_reduction_kw", "export_after_bess_mwh"],
+        title="TOP warianty — wielkość punktu = korzyść roczna, kolor = autokonsumpcja",
+    )
+    st.plotly_chart(fig_opt, use_container_width=True)
+
+    st.dataframe(top[show_cols], use_container_width=True)
+    st.download_button("Pobierz pełny ranking CSV", ranking.to_csv(index=False).encode("utf-8-sig"), "ranking_pv_bess.csv", "text/csv")
 
 st.subheader("Dane godzinowe po symulacji")
 st.dataframe(sim.head(200), use_container_width=True)
