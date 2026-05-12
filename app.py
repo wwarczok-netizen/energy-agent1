@@ -87,8 +87,9 @@ class BessConfig:
     capacity_kwh: float
     power_kw: float
     roundtrip_eff: float
-    initial_soc_pct: float = 10.0
-    min_soc_pct: float = 5.0
+    initial_soc_pct: float = 50.0
+    min_soc_pct: float = 10.0
+    mode: str = "Peak shaving priority"
 
 
 def simulate_pv_bess(
@@ -98,11 +99,22 @@ def simulate_pv_bess(
     bess: BessConfig,
     peak_target_kw: float,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Godzinowy model BESS bez arbitrażu cenowego.
+
+    Zasady:
+    - PV w pierwszej kolejności zasila odbiór klienta.
+    - BESS ładuje się wyłącznie z nadwyżki PV, zgodnie z założeniem zero export w WPW.
+    - BESS może pracować w dwóch trybach:
+      1) Peak shaving priority — bateria oszczędzana jest głównie na godziny przekroczenia celu mocy.
+      2) Self-consumption + peak shaving — bateria redukuje pobór z sieci także poza pikami.
+    - Uwzględniane są: SoC, min. SoC, moc ładowania/rozładowania, pojemność i sprawność.
+    """
     sim = df.copy()
-    load = sim["load_kwh"].to_numpy(dtype=float)  # hourly data, kWh ~= avg kW
+    load = sim["load_kwh"].to_numpy(dtype=float)  # dane godzinowe, kWh ~= średnia moc kW
     pv = synthetic_pv_profile(sim, pv_kwp, annual_yield)
     dt_h = 1.0
-    eta = np.sqrt(bess.roundtrip_eff)
+    eta = np.sqrt(max(min(bess.roundtrip_eff, 1.0), 0.01))
 
     direct = np.minimum(load, pv)
     pv_surplus = np.maximum(pv - load, 0)
@@ -117,10 +129,12 @@ def simulate_pv_bess(
     discharge_peak = np.zeros(len(sim))
     export_after_bess = np.zeros(len(sim))
     soc_series = np.zeros(len(sim))
+    grid_before_bess = residual_load.copy()
     grid_after = np.zeros(len(sim))
+    clipped_peak = np.zeros(len(sim))
 
     for i in range(len(sim)):
-        # 1) charge BESS only from PV surplus, no arbitrage
+        # 1) Ładowanie wyłącznie z nadwyżki PV — brak arbitrażu i brak ładowania z sieci.
         if bess.capacity_kwh > 0 and bess.power_kw > 0 and pv_surplus[i] > 0:
             max_charge_from_power = bess.power_kw * dt_h
             max_charge_from_space = max(0, (max_soc - soc) / eta)
@@ -128,66 +142,94 @@ def simulate_pv_bess(
             charge[i] = ch
             soc += ch * eta
 
-        # 2) discharge for self-consumption against residual load
         grid = residual_load[i]
+
+        # 2) Rozładowanie — tryb peak shaving priority lub pełna autokonsumpcja.
         if bess.capacity_kwh > 0 and bess.power_kw > 0 and grid > 0:
             available = max(0, (soc - min_soc) * eta)
-            power_left = max(0, bess.power_kw * dt_h)
-            dis = min(grid, available, power_left)
-            discharge_self[i] = dis
-            soc -= dis / eta
-            grid -= dis
+            power_left = bess.power_kw * dt_h
 
-        # 3) additional peak shaving to target, if possible
-        if bess.capacity_kwh > 0 and bess.power_kw > 0 and grid > peak_target_kw:
-            available = max(0, (soc - min_soc) * eta)
-            used_power = discharge_self[i]
-            power_left = max(0, bess.power_kw * dt_h - used_power)
-            peak_need = grid - peak_target_kw
-            dis = min(peak_need, available, power_left)
-            discharge_peak[i] = dis
-            soc -= dis / eta
-            grid -= dis
+            if bess.mode == "Self-consumption + peak shaving":
+                # Najpierw redukujemy każdy pobór z sieci, potem pilnujemy peaku.
+                dis = min(grid, available, power_left)
+                discharge_self[i] = dis
+                soc -= dis / eta
+                grid -= dis
+                power_left -= dis
+                available = max(0, (soc - min_soc) * eta)
+
+                if grid > peak_target_kw and power_left > 0 and available > 0:
+                    peak_need = grid - peak_target_kw
+                    dis2 = min(peak_need, available, power_left)
+                    discharge_peak[i] = dis2
+                    soc -= dis2 / eta
+                    grid -= dis2
+            else:
+                # Peak shaving priority: nie rozładowujemy baterii poza pikami, żeby nie wyczyścić SoC przed szczytem.
+                if grid > peak_target_kw:
+                    peak_need = grid - peak_target_kw
+                    dis = min(peak_need, available, power_left)
+                    discharge_peak[i] = dis
+                    soc -= dis / eta
+                    grid -= dis
 
         export_after_bess[i] = max(0, pv_surplus[i] - charge[i])
         soc_series[i] = soc
         grid_after[i] = grid
+        clipped_peak[i] = max(0, grid_before_bess[i] - grid_after[i])
 
     sim["pv_kwh"] = pv
     sim["direct_self_kwh"] = direct
     sim["pv_surplus_kwh"] = pv_surplus
+    sim["grid_before_bess_kwh"] = grid_before_bess
     sim["bess_charge_kwh"] = charge
     sim["bess_discharge_self_kwh"] = discharge_self
     sim["bess_discharge_peak_kwh"] = discharge_peak
+    sim["bess_discharge_total_kwh"] = discharge_self + discharge_peak
     sim["export_potential_kwh"] = pv_surplus
     sim["export_after_bess_kwh"] = export_after_bess
     sim["grid_after_kwh"] = grid_after
+    sim["peak_reduction_hourly_kwh"] = clipped_peak
     sim["soc_kwh"] = soc_series
+    sim["soc_pct"] = np.where(bess.capacity_kwh > 0, soc_series / bess.capacity_kwh * 100, 0)
 
     pv_total = pv.sum()
-    used_pv = direct.sum() + charge.sum()
-    autokonsumpcja = used_pv / pv_total if pv_total else 0
     export_potential = pv_surplus.sum()
     export_after = export_after_bess.sum()
+    pv_used_direct = direct.sum()
+    pv_used_via_bess = charge.sum() - export_after_bess.sum() * 0  # informacyjnie: energia skierowana do BESS z PV
+    used_pv = pv_total - export_after
+    autokonsumpcja = used_pv / pv_total if pv_total else 0
     peak_before = load.max()
+    peak_after_pv = residual_load.max()
     peak_after = grid_after.max()
     peak_reduction_kw = max(0, peak_before - peak_after)
+    bess_discharge_total = (discharge_self.sum() + discharge_peak.sum())
+    equivalent_cycles = bess_discharge_total / bess.capacity_kwh if bess.capacity_kwh > 0 else 0
+    export_reduction = export_potential - export_after
 
     metrics = {
         "load_mwh": load.sum() / 1000,
         "pv_mwh": pv_total / 1000,
+        "direct_self_mwh": pv_used_direct / 1000,
         "autokonsumpcja_pct": autokonsumpcja * 100,
         "export_potential_mwh": export_potential / 1000,
         "export_after_bess_mwh": export_after / 1000,
+        "export_reduction_mwh": export_reduction / 1000,
         "bess_charge_mwh": charge.sum() / 1000,
-        "bess_discharge_mwh": (discharge_self.sum() + discharge_peak.sum()) / 1000,
+        "bess_discharge_mwh": bess_discharge_total / 1000,
+        "bess_discharge_peak_mwh": discharge_peak.sum() / 1000,
+        "bess_discharge_self_mwh": discharge_self.sum() / 1000,
+        "bess_equivalent_cycles": equivalent_cycles,
         "peak_before_kw": peak_before,
+        "peak_after_pv_kw": peak_after_pv,
         "peak_after_kw": peak_after,
         "peak_reduction_kw": peak_reduction_kw,
         "grid_after_mwh": grid_after.sum() / 1000,
+        "min_soc_pct": sim["soc_pct"].min() if bess.capacity_kwh > 0 else 0,
+        "avg_soc_pct": sim["soc_pct"].mean() if bess.capacity_kwh > 0 else 0,
     }
     return sim, metrics
-
 
 def financials(metrics: Dict[str, float], pv_kwp: float, bess: BessConfig, params: Dict[str, float]) -> Dict[str, float]:
     energy_value = params["energy_price_pln_mwh"] + params["distribution_price_pln_mwh"]
@@ -256,7 +298,14 @@ def optimize_variants(df, annual_yield, params, min_sc=80.0):
     for pv in pv_sizes:
         for cap in bess_sizes:
             power = min(cap, params["bess_power_kw"]) if cap > 0 else 0
-            bess = BessConfig(capacity_kwh=cap, power_kw=power, roundtrip_eff=params["bess_eff_pct"] / 100)
+            bess = BessConfig(
+                capacity_kwh=cap,
+                power_kw=power,
+                roundtrip_eff=params["bess_eff_pct"] / 100,
+                initial_soc_pct=params.get("initial_soc_pct", 50),
+                min_soc_pct=params.get("min_soc_pct", 10),
+                mode=params.get("bess_mode", "Peak shaving priority"),
+            )
             _, m = simulate_pv_bess(df, pv, annual_yield, bess, peak_target)
             f = financials(m, pv, bess, params)
             rows.append({"PV kWp": pv, "BESS kWh": cap, "BESS kW": power, **m, **f})
@@ -266,7 +315,7 @@ def optimize_variants(df, annual_yield, params, min_sc=80.0):
 
 
 st.title("Energy Agent MVP — dobór PV + BESS")
-st.caption("MVP: autokonsumpcja, eksport jako potencjał BESS, peak shaving, ROI, IRR, DSCR, SaaS/CAPEX, opłata mocowa. Bez arbitrażu cenowego.")
+st.caption("MVP: autokonsumpcja, eksport jako potencjał BESS, godzinowy model SoC magazynu, peak shaving, ROI, IRR, DSCR, SaaS/CAPEX, opłata mocowa. Bez arbitrażu cenowego.")
 
 with st.sidebar:
     st.header("Dane wejściowe")
@@ -277,6 +326,13 @@ with st.sidebar:
     bess_capacity = st.number_input("Pojemność BESS [kWh]", 0, 10000, 500, 50)
     bess_power = st.number_input("Moc BESS [kW]", 0, 10000, 500, 50)
     bess_eff = st.slider("Sprawność round-trip BESS [%]", 70, 98, 90)
+    bess_mode = st.selectbox(
+        "Tryb pracy BESS",
+        ["Peak shaving priority", "Self-consumption + peak shaving"],
+        help="Peak shaving priority oszczędza baterię na piki. Drugi tryb mocniej podnosi autokonsumpcję, ale może zużyć SoC przed szczytem."
+    )
+    initial_soc = st.slider("Startowy SoC BESS [%]", 0, 100, 50)
+    min_soc = st.slider("Minimalny SoC BESS [%]", 0, 50, 10)
     peak_target = st.number_input("Cel peak shaving — moc po redukcji [kW]", 0, 10000, 1000, 10)
 
     st.subheader("Optimizer — automatyczny dobór")
@@ -335,10 +391,13 @@ params = {
     "opt_bess_step_kwh": int(opt_bess_step),
     "bess_power_kw": bess_power,
     "bess_eff_pct": bess_eff,
+    "bess_mode": bess_mode,
+    "initial_soc_pct": initial_soc,
+    "min_soc_pct": min_soc,
     "peak_target_kw": peak_target,
 }
 
-bess = BessConfig(bess_capacity, bess_power, bess_eff / 100)
+bess = BessConfig(bess_capacity, bess_power, bess_eff / 100, initial_soc, min_soc, bess_mode)
 sim, metrics = simulate_pv_bess(df, pv_kwp, annual_yield, bess, peak_target)
 fin = financials(metrics, pv_kwp, bess, params)
 
@@ -359,6 +418,13 @@ cols2[1].metric("ROI", f"{kpi['roi_pct']:.1f}%")
 cols2[2].metric("IRR", "—" if pd.isna(kpi['irr_pct']) else f"{kpi['irr_pct']:.1f}%")
 cols2[3].metric("DSCR", "—" if pd.isna(kpi['dscr']) else f"{kpi['dscr']:.2f}")
 cols2[4].metric("SaaS net/rok", f"{kpi['saas_annual_net_pln']:,.0f} PLN".replace(",", " "))
+
+cols3 = st.columns(5)
+cols3[0].metric("Eksport po BESS", f"{kpi['export_after_bess_mwh']:,.0f} MWh".replace(",", " "))
+cols3[1].metric("Eksport zredukowany", f"{kpi['export_reduction_mwh']:,.0f} MWh".replace(",", " "))
+cols3[2].metric("Praca BESS", f"{kpi['bess_discharge_mwh']:,.0f} MWh".replace(",", " "))
+cols3[3].metric("Cykle ekwiwalentne", f"{kpi['bess_equivalent_cycles']:.1f} / rok")
+cols3[4].metric("Śr. SoC", f"{kpi['avg_soc_pct']:.0f}%")
 
 if kpi["autokonsumpcja_pct"] < 80:
     st.warning("Ten wariant nie spełnia celu minimalnej autokonsumpcji 80%. Zmniejsz PV albo zwiększ BESS.")
@@ -437,13 +503,44 @@ fig_peak.update_traces(texttemplate="%{text:.0f} kW", textposition="outside")
 fig_peak.update_layout(yaxis_title="kW")
 st.plotly_chart(fig_peak, use_container_width=True)
 
-# 5) Próbka godzinowa — pierwsze 14 dni z baterią i poborem po optymalizacji
+# 5) Bilans pracy BESS — czy bateria pracuje bardziej pod piki, czy pod autokonsumpcję
+st.subheader("Bilans pracy BESS")
+bess_balance = pd.DataFrame({
+    "Kategoria": ["Ładowanie z nadwyżki PV", "Rozładowanie na autokonsumpcję", "Rozładowanie na peak shaving", "Eksport po BESS"],
+    "MWh": [
+        kpi["bess_charge_mwh"],
+        kpi["bess_discharge_self_mwh"],
+        kpi["bess_discharge_peak_mwh"],
+        kpi["export_after_bess_mwh"],
+    ],
+})
+fig_bess_balance = px.bar(bess_balance, x="Kategoria", y="MWh", text="MWh", title="Energia przepływająca przez BESS i eksport po magazynie")
+fig_bess_balance.update_traces(texttemplate="%{text:.0f} MWh", textposition="outside")
+st.plotly_chart(fig_bess_balance, use_container_width=True)
+
+# 6) Krzywa czasu trwania poboru — dobrze pokazuje efekt peak shavingu
+st.subheader("Krzywa czasu trwania poboru — przed i po BESS")
+duration_df = pd.DataFrame({
+    "Godzina rankingu": np.arange(1, len(sim) + 1),
+    "Przed BESS [kW]": np.sort(sim["grid_before_bess_kwh"].to_numpy())[::-1],
+    "Po BESS [kW]": np.sort(sim["grid_after_kwh"].to_numpy())[::-1],
+})
+fig_duration = go.Figure()
+fig_duration.add_scatter(x=duration_df["Godzina rankingu"], y=duration_df["Przed BESS [kW]"], name="Po PV, przed BESS")
+fig_duration.add_scatter(x=duration_df["Godzina rankingu"], y=duration_df["Po BESS [kW]"], name="Po BESS")
+fig_duration.add_hline(y=peak_target, line_dash="dash", annotation_text="Cel peak shaving")
+fig_duration.update_layout(xaxis_title="Godziny posortowane od najwyższego poboru", yaxis_title="kW")
+st.plotly_chart(fig_duration, use_container_width=True)
+
+# 7) Próbka godzinowa — pierwsze 14 dni z baterią i poborem po optymalizacji
 st.subheader("Przebieg godzinowy — próbka pierwszych 14 dni")
 sample = sim.iloc[: min(24*14, len(sim))]
 fig2 = go.Figure()
 fig2.add_scatter(x=sample["timestamp"], y=sample["load_kwh"], name="Zużycie kWh")
 fig2.add_scatter(x=sample["timestamp"], y=sample["pv_kwh"], name="PV kWh")
 fig2.add_scatter(x=sample["timestamp"], y=sample["grid_after_kwh"], name="Pobór z sieci po PV+BESS")
+fig2.add_scatter(x=sample["timestamp"], y=sample["bess_charge_kwh"], name="Ładowanie BESS")
+fig2.add_scatter(x=sample["timestamp"], y=sample["bess_discharge_total_kwh"], name="Rozładowanie BESS")
 fig2.add_scatter(x=sample["timestamp"], y=sample["soc_kwh"], name="SoC BESS kWh", yaxis="y2")
 fig2.update_layout(
     xaxis_title="Czas",
