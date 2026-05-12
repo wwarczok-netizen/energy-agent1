@@ -346,6 +346,8 @@ else:
     st.success("Ten wariant spełnia cel minimalnej autokonsumpcji 80%.")
 
 st.subheader("Wykresy")
+
+# 1) Miesięczne porównanie zużycia, PV i eksportu
 monthly = sim.groupby("month", as_index=False).agg(
     load_mwh=("load_kwh", lambda x: x.sum()/1000),
     pv_mwh=("pv_kwh", lambda x: x.sum()/1000),
@@ -359,16 +361,84 @@ fig.add_bar(x=monthly["month"], y=monthly["export_potential_mwh"], name="Eksport
 fig.update_layout(barmode="group", xaxis_title="Miesiąc", yaxis_title="MWh")
 st.plotly_chart(fig, use_container_width=True)
 
+# 2) Heatmapa godzinowa po dniach roku — najlepsza do rozmowy z klientem o profilu pracy
+st.subheader("Heatmapa godzinowa zużycia — dzień roku × godzina")
+sim["day_of_year"] = sim["timestamp"].dt.dayofyear
+heat_year = sim.pivot_table(
+    index="hour",
+    columns="day_of_year",
+    values="load_kwh",
+    aggfunc="mean"
+)
+fig_heat_year = px.imshow(
+    heat_year,
+    aspect="auto",
+    labels=dict(x="Dzień roku", y="Godzina", color="kWh/h"),
+    title="Profil zużycia energii w układzie godzinowym"
+)
+fig_heat_year.update_yaxes(autorange="reversed")
+st.plotly_chart(fig_heat_year, use_container_width=True)
+
+# 3) Średni profil dobowy — osobno dni robocze i niedziele
+st.subheader("Średni profil dobowy")
+sim["typ_dnia"] = np.where(sim["is_sunday"], "Niedziela", "Pon.–sob.")
+daily_profile = sim.groupby(["hour", "typ_dnia"], as_index=False).agg(
+    load_kwh=("load_kwh", "mean"),
+    pv_kwh=("pv_kwh", "mean"),
+    grid_after_kwh=("grid_after_kwh", "mean"),
+)
+fig_daily = go.Figure()
+for day_type in daily_profile["typ_dnia"].unique():
+    part = daily_profile[daily_profile["typ_dnia"] == day_type]
+    fig_daily.add_scatter(x=part["hour"], y=part["load_kwh"], mode="lines", name=f"Zużycie — {day_type}")
+fig_daily.add_scatter(
+    x=daily_profile.groupby("hour", as_index=False)["pv_kwh"].mean()["hour"],
+    y=daily_profile.groupby("hour", as_index=False)["pv_kwh"].mean()["pv_kwh"],
+    mode="lines",
+    name="PV — średnio"
+)
+fig_daily.update_layout(xaxis_title="Godzina", yaxis_title="kWh/h")
+st.plotly_chart(fig_daily, use_container_width=True)
+
+# 4) Peak shaving — przed i po BESS
+st.subheader("Peak shaving — przed i po PV+BESS")
+peak_df = pd.DataFrame({
+    "Stan": ["Przed PV+BESS", "Po PV+BESS"],
+    "Moc [kW]": [kpi["peak_before_kw"], kpi["peak_after_kw"]],
+})
+fig_peak = px.bar(
+    peak_df,
+    x="Stan",
+    y="Moc [kW]",
+    text="Moc [kW]",
+    title=f"Redukcja peaku: {kpi['peak_reduction_kw']:.0f} kW"
+)
+fig_peak.update_traces(texttemplate="%{text:.0f} kW", textposition="outside")
+fig_peak.update_layout(yaxis_title="kW")
+st.plotly_chart(fig_peak, use_container_width=True)
+
+# 5) Próbka godzinowa — pierwsze 14 dni z baterią i poborem po optymalizacji
+st.subheader("Przebieg godzinowy — próbka pierwszych 14 dni")
 sample = sim.iloc[: min(24*14, len(sim))]
 fig2 = go.Figure()
 fig2.add_scatter(x=sample["timestamp"], y=sample["load_kwh"], name="Zużycie kWh")
 fig2.add_scatter(x=sample["timestamp"], y=sample["pv_kwh"], name="PV kWh")
 fig2.add_scatter(x=sample["timestamp"], y=sample["grid_after_kwh"], name="Pobór z sieci po PV+BESS")
-fig2.update_layout(xaxis_title="Czas", yaxis_title="kWh / h")
+fig2.add_scatter(x=sample["timestamp"], y=sample["soc_kwh"], name="SoC BESS kWh", yaxis="y2")
+fig2.update_layout(
+    xaxis_title="Czas",
+    yaxis_title="kWh / h",
+    yaxis2=dict(title="SoC BESS [kWh]", overlaying="y", side="right", showgrid=False),
+)
 st.plotly_chart(fig2, use_container_width=True)
 
+# 6) Heatmapa typowego tygodnia — szybki obraz rytmu pracy zakładu
+st.subheader("Heatmapa typowego tygodnia — średnie zużycie")
+weekday_labels = {0: "Pon", 1: "Wt", 2: "Śr", 3: "Czw", 4: "Pt", 5: "Sob", 6: "Niedz"}
 heat = sim.pivot_table(index="hour", columns="weekday", values="load_kwh", aggfunc="mean")
+heat = heat.rename(columns=weekday_labels)
 fig3 = px.imshow(heat, labels=dict(x="Dzień tygodnia", y="Godzina", color="Śr. kWh"), aspect="auto")
+fig3.update_yaxes(autorange="reversed")
 st.plotly_chart(fig3, use_container_width=True)
 
 st.subheader("Optymalizacja wariantów")
