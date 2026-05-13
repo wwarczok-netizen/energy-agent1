@@ -21,38 +21,234 @@ def parse_number_pl(x):
     return float(s.replace(",", "."))
 
 
+def decode_csv_bytes(raw: bytes) -> str:
+    for enc in ["utf-8-sig", "cp1250", "iso-8859-2", "latin1"]:
+        try:
+            return raw.decode(enc)
+        except Exception:
+            pass
+    return raw.decode("latin1", errors="ignore")
+
+
+def load_pvsyst_export(text: str) -> pd.DataFrame:
+    """Obsługa eksportów PVsyst/arkuszy z blokiem nagłówkowym przed tabelą godzinową."""
+    lines = text.splitlines()
+    data_start = None
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}", line):
+            data_start = i
+            break
+    if data_start is None:
+        raise ValueError("Nie znaleziono początku danych godzinowych w pliku PVsyst.")
+
+    data_text = "\n".join(lines[data_start:])
+    tmp = pd.read_csv(
+        io.StringIO(data_text),
+        sep=";",
+        header=None,
+        usecols=[0, 1, 2, 3],
+        names=["date", "pv_kwh", "load_kwh", "export_kwh"],
+        decimal=",",
+    )
+
+    out = pd.DataFrame()
+    out["timestamp"] = pd.to_datetime(tmp["date"].astype(str), format="%d.%m.%Y %H:%M", errors="coerce")
+    out["load_kwh"] = pd.to_numeric(tmp["load_kwh"].astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0)
+    out["source_pv_kwh"] = pd.to_numeric(tmp["pv_kwh"].astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0)
+    out["source_export_kwh"] = pd.to_numeric(tmp["export_kwh"].astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0)
+    out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return enrich_time_columns(out)
+
+
 def load_csv(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.getvalue()
+    text = decode_csv_bytes(raw)
+
+    # Specjalny przypadek: PVsyst z metadanymi u góry i tabelą od wiersza „date;Produkcja PV...”.
+    if "Produkcja PV" in text and "Zapotrzebowanie klienta" in text:
+        return load_pvsyst_export(text)
+
     last_error = None
     for enc in ["utf-8-sig", "cp1250", "latin1"]:
         for sep in ["\t", ";", ","]:
             try:
                 df = pd.read_csv(io.BytesIO(raw), sep=sep, encoding=enc)
                 if df.shape[1] >= 2:
-                    return normalize_profile(df)
+                    prof = normalize_profile(df)
+                    if len(prof) > 0:
+                        return prof
             except Exception as e:
                 last_error = e
     raise ValueError(f"Nie udało się odczytać CSV: {last_error}")
 
 
-def normalize_profile(df: pd.DataFrame) -> pd.DataFrame:
-    # Column detection
-    date_col = df.columns[0]
-    load_col = None
-    for c in df.columns:
-        cl = str(c).lower()
-        if "pobranej" in cl or "zuży" in cl or "pobor" in cl or "load" in cl:
-            load_col = c
-            break
-    if load_col is None:
-        load_col = df.columns[1]
+def load_excel(uploaded_file) -> pd.DataFrame:
+    """Auto-import XLSX/XLS: czyta arkusz i normalizuje profil.
 
+    Obsługuje proste arkusze typu:
+    Data | Wolumen energii elektrycznej pobranej z sieci przed bilansowaniem godzinowym
+    oraz podobne eksporty, gdzie jedna kolumna jest datą/czasem, a druga energią.
+    """
+    raw = uploaded_file.getvalue()
+    last_error = None
+    try:
+        xls = pd.ExcelFile(io.BytesIO(raw))
+        # Najpierw szukamy arkusza, który daje sensowny profil.
+        for sheet_name in xls.sheet_names:
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                df = df.dropna(how="all")
+                if df.shape[1] >= 2:
+                    prof = normalize_profile(df)
+                    if len(prof) > 0:
+                        return prof
+            except Exception as e:
+                last_error = e
+                continue
+    except Exception as e:
+        last_error = e
+    raise ValueError(f"Nie udało się odczytać Excela: {last_error}")
+
+
+def load_profile_auto(uploaded_file) -> pd.DataFrame:
+    name = (uploaded_file.name or "").lower()
+    if name.endswith((".xlsx", ".xls")):
+        return load_excel(uploaded_file)
+    return load_csv(uploaded_file)
+
+
+
+def read_generic_csv(raw: bytes, max_skiprows: int = 40) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Czyta różne CSV do surowej tabeli dla ręcznego mapowania kolumn.
+    Testuje kodowanie, separator i pierwsze wiersze metadanych.
+    """
+    best = None
+    best_score = -1
+    best_meta = {}
+    for enc in ["utf-8-sig", "cp1250", "iso-8859-2", "latin1"]:
+        for sep in [";", ",", "\t"]:
+            for skip in range(0, max_skiprows + 1):
+                try:
+                    tmp = pd.read_csv(io.BytesIO(raw), sep=sep, encoding=enc, skiprows=skip, nrows=300)
+                    if tmp.shape[1] < 2:
+                        continue
+                    date_score = 0
+                    num_score = 0
+                    for c in tmp.columns:
+                        sample = tmp[c].astype(str).head(100).str.replace(r"([0-9]{2}:[0-9]{2})[A-Z]$", r"\1", regex=True)
+                        date_score = max(date_score, pd.to_datetime(sample, dayfirst=True, errors="coerce").notna().sum())
+                        try:
+                            nums = sample.map(parse_number_pl)
+                            num_score += int((nums != 0).sum())
+                        except Exception:
+                            pass
+                    score = tmp.shape[1] * 10 + date_score * 3 + min(num_score, 300)
+                    if score > best_score:
+                        best_score = score
+                        best_meta = {"typ": "CSV", "encoding": enc, "separator": repr(sep), "skiprows": str(skip)}
+                        best = pd.read_csv(io.BytesIO(raw), sep=sep, encoding=enc, skiprows=skip)
+                except Exception:
+                    continue
+    if best is None:
+        raise ValueError("Nie udało się odczytać pliku CSV w trybie uniwersalnym.")
+    best = best.dropna(how="all")
+    best.columns = [str(c).strip() for c in best.columns]
+    return best, best_meta
+
+
+def read_generic_excel(raw: bytes) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Czyta XLSX/XLS do surowej tabeli dla ręcznego mapowania kolumn."""
+    try:
+        xls = pd.ExcelFile(io.BytesIO(raw))
+    except Exception as e:
+        raise ValueError(f"Nie udało się otworzyć Excela: {e}")
+
+    best = None
+    best_score = -1
+    best_meta = {}
+    for sheet_name in xls.sheet_names:
+        for header in range(0, 20):
+            try:
+                tmp = pd.read_excel(xls, sheet_name=sheet_name, header=header, nrows=300)
+                tmp = tmp.dropna(how="all")
+                if tmp.shape[1] < 2:
+                    continue
+                date_score = 0
+                num_score = 0
+                for c in tmp.columns:
+                    sample = tmp[c].astype(str).head(100).str.replace(r"([0-9]{2}:[0-9]{2})[A-Z]$", r"\1", regex=True)
+                    date_score = max(date_score, pd.to_datetime(sample, dayfirst=True, errors="coerce").notna().sum())
+                    try:
+                        nums = sample.map(parse_number_pl)
+                        num_score += int((nums != 0).sum())
+                    except Exception:
+                        pass
+                score = tmp.shape[1] * 10 + date_score * 3 + min(num_score, 300)
+                if score > best_score:
+                    best_score = score
+                    best_meta = {"typ": "Excel", "arkusz": sheet_name, "header_row": str(header + 1)}
+                    best = pd.read_excel(xls, sheet_name=sheet_name, header=header)
+            except Exception:
+                continue
+    if best is None:
+        raise ValueError("Nie udało się odczytać Excela w trybie uniwersalnym.")
+    best = best.dropna(how="all")
+    best.columns = [str(c).strip() for c in best.columns]
+    return best, best_meta
+
+
+def read_generic_table(uploaded_file) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    raw = uploaded_file.getvalue()
+    name = (uploaded_file.name or "").lower()
+    if name.endswith((".xlsx", ".xls")):
+        return read_generic_excel(raw)
+    return read_generic_csv(raw)
+
+
+def guess_column(cols: List[str], keywords: List[str], excludes: List[str] = None):
+    excludes = excludes or []
+    for c in cols:
+        cl = str(c).lower()
+        if any(e in cl for e in excludes):
+            continue
+        if any(k in cl for k in keywords):
+            return c
+    return cols[0] if cols else None
+
+
+def normalize_profile_manual(
+    raw_df: pd.DataFrame,
+    date_col: str,
+    load_col: str,
+    time_col: str = "— brak —",
+    pv_col: str = "— brak —",
+    export_col: str = "— brak —",
+    unit: str = "kWh",
+    aggregate_hourly: bool = True,
+) -> pd.DataFrame:
     out = pd.DataFrame()
-    # Handle Polish DSO daylight-saving suffixes such as 02:59A / 02:59B
-    dt_text = df[date_col].astype(str).str.replace(r"([0-9]{2}:[0-9]{2})[A-Z]$", r"\1", regex=True)
-    out["timestamp"] = pd.to_datetime(dt_text, errors="coerce")
-    out["load_kwh"] = df[load_col].map(parse_number_pl)
-    out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    if time_col and time_col != "— brak —":
+        dt_text = raw_df[date_col].astype(str).str.strip() + " " + raw_df[time_col].astype(str).str.strip()
+    else:
+        dt_text = raw_df[date_col].astype(str).str.strip()
+    dt_text = dt_text.str.replace(r"([0-9]{2}:[0-9]{2})[A-Z]$", r"\1", regex=True)
+    out["timestamp"] = pd.to_datetime(dt_text, dayfirst=True, errors="coerce")
+
+    multiplier = 1000.0 if unit == "MWh" else 1.0
+    out["load_kwh"] = raw_df[load_col].map(parse_number_pl) * multiplier
+    if pv_col and pv_col != "— brak —":
+        out["source_pv_kwh"] = raw_df[pv_col].map(parse_number_pl) * multiplier
+    if export_col and export_col != "— brak —":
+        out["source_export_kwh"] = raw_df[export_col].map(parse_number_pl) * multiplier
+
+    out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
+    value_cols = [c for c in out.columns if c != "timestamp"]
+    if aggregate_hourly:
+        out["timestamp"] = out["timestamp"].dt.floor("h")
+    out = out.groupby("timestamp", as_index=False)[value_cols].sum()
+    return enrich_time_columns(out)
+
+def enrich_time_columns(out: pd.DataFrame) -> pd.DataFrame:
     out["date"] = out["timestamp"].dt.date
     out["hour"] = out["timestamp"].dt.hour
     out["month"] = out["timestamp"].dt.month
@@ -60,6 +256,105 @@ def normalize_profile(df: pd.DataFrame) -> pd.DataFrame:
     out["is_sunday"] = out["weekday"].eq(6)
     return out
 
+
+def normalize_profile(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalizuje różne formaty profili godzinowych do: timestamp, load_kwh (+ opcjonalnie source_pv_kwh/export).
+
+    Obsługiwane m.in.:
+    - klasyczne CSV: data/godzina + zużycie,
+    - eksporty OSD/sprzedawców: „Data i godzina”, „Wartosc[kWh/kvar]”, „Rodzaj energii”,
+    - pliki z produkcją PV i eksportem.
+    """
+    # Ujednolicenie nazw pomocniczo, ale bez utraty oryginalnych nazw kolumn
+    cols = list(df.columns)
+    col_l = {c: str(c).strip().lower() for c in cols}
+
+    # 1) Kolumna daty/godziny — nie zakładamy już, że jest pierwsza.
+    date_col = None
+    date_keywords = ["data i godzina", "data/godzina", "datetime", "timestamp", "czas", "date", "godzina"]
+    for c in cols:
+        cl = col_l[c]
+        if any(k in cl for k in date_keywords):
+            date_col = c
+            break
+    if date_col is None:
+        # fallback: wybierz kolumnę, która najlepiej parsuje się jako data
+        best_col, best_score = None, -1
+        for c in cols:
+            sample = df[c].astype(str).head(200).str.replace(r"([0-9]{2}:[0-9]{2})[A-Z]$", r"\1", regex=True)
+            parsed = pd.to_datetime(sample, dayfirst=True, errors="coerce")
+            score = parsed.notna().sum()
+            if score > best_score:
+                best_col, best_score = c, score
+        date_col = best_col
+
+    # 2) Kolumna zużycia — wykluczamy kolumnę PPE „punkt poboru”, bo zawiera słowo poboru, ale nie jest energią.
+    load_col = None
+    strong_load_keywords = [
+        "wartosc", "wartość", "kwh", "energia czynna pobrana", "zapotrzeb", "zuży", "zuzy", "load", "consumption", "pobrana"
+    ]
+    exclude_keywords = ["punkt poboru", "ppe", "nr punktu", "platnika", "płatnika", "kompletnosc", "kompletność", "strefa", "rodzaj energii"]
+    for c in cols:
+        if c == date_col:
+            continue
+        cl = col_l[c]
+        if any(ex in cl for ex in exclude_keywords):
+            continue
+        if any(k in cl for k in strong_load_keywords):
+            load_col = c
+            break
+
+    # Szczególny format: OSD/sprzedawca ma „Rodzaj energii” + „Wartosc[kWh/kvar]”.
+    rodzaj_col = next((c for c in cols if "rodzaj energii" in col_l[c]), None)
+    wartosc_col = next((c for c in cols if "wartosc" in col_l[c] or "wartość" in col_l[c]), None)
+    if rodzaj_col is not None and wartosc_col is not None:
+        # Jeżeli są różne rodzaje energii, bierzemy pobraną czynną. W tym pliku jest właśnie tylko ona.
+        mask = df[rodzaj_col].astype(str).str.lower().str.contains("czynna") & df[rodzaj_col].astype(str).str.lower().str.contains("pobran")
+        if mask.any():
+            df = df.loc[mask].copy()
+        load_col = wartosc_col
+
+    if load_col is None:
+        # fallback: pierwsza sensowna numeryczna kolumna poza datą i metadanymi
+        best_col, best_numeric = None, -1
+        for c in cols:
+            if c == date_col:
+                continue
+            cl = col_l[c]
+            if any(ex in cl for ex in exclude_keywords):
+                continue
+            nums = df[c].map(parse_number_pl)
+            score = (nums != 0).sum()
+            if score > best_numeric:
+                best_col, best_numeric = c, score
+        load_col = best_col
+
+    # 3) PV i eksport, jeżeli istnieją.
+    pv_col = None
+    export_col = None
+    for c in df.columns:
+        cl = str(c).lower()
+        if pv_col is None and ("produkcja pv" in cl or cl.strip() == "pv" or "production" in cl):
+            pv_col = c
+        if export_col is None and ("wprowadzone" in cl or "eksport" in cl or "export" in cl):
+            export_col = c
+
+    out = pd.DataFrame()
+    dt_text = df[date_col].astype(str).str.strip().str.replace(r"([0-9]{2}:[0-9]{2})[A-Z]$", r"\1", regex=True)
+    out["timestamp"] = pd.to_datetime(dt_text, dayfirst=True, errors="coerce")
+    out["load_kwh"] = df[load_col].map(parse_number_pl)
+    if pv_col is not None:
+        out["source_pv_kwh"] = df[pv_col].map(parse_number_pl)
+    if export_col is not None:
+        out["source_export_kwh"] = df[export_col].map(parse_number_pl)
+
+    out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    # Usunięcie ewentualnych duplikatów timestamp przez sumowanie energii.
+    value_cols = [c for c in out.columns if c != "timestamp"]
+    out = out.groupby("timestamp", as_index=False)[value_cols].sum()
+
+    return enrich_time_columns(out)
 
 def synthetic_pv_profile(df: pd.DataFrame, pv_kwp: float, annual_yield_kwh_kwp: float) -> np.ndarray:
     ts = df["timestamp"]
@@ -112,7 +407,13 @@ def simulate_pv_bess(
     """
     sim = df.copy()
     load = sim["load_kwh"].to_numpy(dtype=float)  # dane godzinowe, kWh ~= średnia moc kW
-    pv = synthetic_pv_profile(sim, pv_kwp, annual_yield)
+    if "source_pv_kwh" in sim.columns and sim["source_pv_kwh"].sum() > 0:
+        # Plik zawiera rzeczywistą/symulowaną produkcję PV godzinową.
+        # Skalujemy ją do wybranej mocy PV, wyznaczając moc bazową z rocznej produkcji i założonego uzysku.
+        base_pv_kwp = sim["source_pv_kwh"].sum() / max(annual_yield, 1)
+        pv = sim["source_pv_kwh"].to_numpy(dtype=float) * (pv_kwp / base_pv_kwp if base_pv_kwp > 0 else 1.0)
+    else:
+        pv = synthetic_pv_profile(sim, pv_kwp, annual_yield)
     dt_h = 1.0
     eta = np.sqrt(max(min(bess.roundtrip_eff, 1.0), 0.01))
 
@@ -319,7 +620,7 @@ st.caption("MVP: autokonsumpcja, eksport jako potencjał BESS, godzinowy model S
 
 with st.sidebar:
     st.header("Dane wejściowe")
-    uploaded = st.file_uploader("Wgraj CSV z profilem dobowo-godzinowym", type=["csv", "txt"])
+    uploaded = st.file_uploader("Wgraj profil dobowo-godzinowy", type=["csv", "txt", "xlsx", "xls"])
     st.subheader("Założenia techniczne")
     pv_kwp = st.number_input("Moc PV [kWp]", 10, 10000, 1200, 10)
     annual_yield = st.number_input("Uzysk PV [kWh/kWp/rok]", 700, 1300, 1050, 10)
@@ -364,13 +665,63 @@ with st.sidebar:
     analysis_years = st.number_input("Okres analizy IRR [lata]", 1, 30, 15, 1)
 
 if not uploaded:
-    st.info("Wgraj CSV, żeby uruchomić analizę.")
+    st.info("Wgraj CSV/XLSX, żeby uruchomić analizę.")
     st.stop()
 
+raw_bytes = uploaded.getvalue()
+
+st.subheader("Importer profilu")
+import_mode = st.radio(
+    "Tryb importu",
+    ["Auto — rozpoznaj format", "Manual — wskaż kolumny"],
+    horizontal=True,
+    help="Auto obsługuje znane formaty CSV/XLSX. Manual pozwala wskazać kolumny daty oraz zużycia."
+)
+
 try:
-    df = load_csv(uploaded)
+    if import_mode.startswith("Auto"):
+        df = load_profile_auto(uploaded)
+        st.success(f"Plik odczytany automatycznie: {len(df):,} rekordów, {df['load_kwh'].sum()/1000:,.2f} MWh zużycia.".replace(",", " "))
+        with st.expander("Podgląd znormalizowanych danych"):
+            st.dataframe(df.head(50), use_container_width=True)
+    else:
+        raw_df, meta = read_generic_table(uploaded)
+        cols_raw = list(raw_df.columns)
+        st.caption("Wykryto: " + ", ".join([f"{k}: {v}" for k, v in meta.items()]))
+        with st.expander("Podgląd surowego pliku", expanded=True):
+            st.dataframe(raw_df.head(30), use_container_width=True)
+
+        date_guess = guess_column(cols_raw, ["data i godzina", "data/godzina", "datetime", "timestamp", "czas", "date", "data"])
+        load_guess = guess_column(
+            cols_raw,
+            ["wartosc", "wartość", "kwh", "energia czynna pobrana", "zapotrzeb", "zuży", "zuzy", "load", "consumption", "pobrana"],
+            ["punkt poboru", "ppe", "nr punktu", "rodzaj energii"]
+        )
+        pv_guess = guess_column(cols_raw, ["produkcja pv", "pv", "production", "generacja"], [])
+        export_guess = guess_column(cols_raw, ["wprowadzone", "eksport", "export", "oddana"], [])
+
+        none_option = "— brak —"
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            date_col = st.selectbox("Kolumna daty / daty i godziny", cols_raw, index=cols_raw.index(date_guess) if date_guess in cols_raw else 0)
+            time_col = st.selectbox("Opcjonalna osobna kolumna godziny", [none_option] + cols_raw, index=0)
+        with c2:
+            load_col = st.selectbox("Kolumna zużycia / zapotrzebowania", cols_raw, index=cols_raw.index(load_guess) if load_guess in cols_raw else 0)
+            unit = st.selectbox("Jednostka energii w pliku", ["kWh", "MWh"], index=0)
+        with c3:
+            pv_options = [none_option] + cols_raw
+            export_options = [none_option] + cols_raw
+            pv_col = st.selectbox("Opcjonalna kolumna produkcji PV", pv_options, index=pv_options.index(pv_guess) if pv_guess in pv_options else 0)
+            export_col = st.selectbox("Opcjonalna kolumna eksportu", export_options, index=export_options.index(export_guess) if export_guess in export_options else 0)
+
+        aggregate_hourly = st.checkbox("Agreguj dane do godzin", value=True, help="Włączone: 15-minutówki zostaną zsumowane do danych godzinowych.")
+        df = normalize_profile_manual(raw_df, date_col, load_col, time_col, pv_col, export_col, unit, aggregate_hourly)
+        st.success(f"Profil zmapowany: {len(df):,} rekordów, {df['load_kwh'].sum()/1000:,.2f} MWh zużycia.".replace(",", " "))
+        with st.expander("Podgląd znormalizowanych danych"):
+            st.dataframe(df.head(50), use_container_width=True)
 except Exception as e:
-    st.error(str(e))
+    st.error(f"Nie udało się zaimportować profilu: {e}")
+    st.info("Przełącz tryb importu na Manual i wskaż kolumny: data/godzina oraz zużycie.")
     st.stop()
 
 params = {
