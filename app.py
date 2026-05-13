@@ -385,6 +385,7 @@ class BessConfig:
     initial_soc_pct: float = 50.0
     min_soc_pct: float = 10.0
     mode: str = "Peak shaving priority"
+    pv_mode: str = "Auto"
 
 
 def simulate_pv_bess(
@@ -407,19 +408,43 @@ def simulate_pv_bess(
     """
     sim = df.copy()
     load = sim["load_kwh"].to_numpy(dtype=float)  # dane godzinowe, kWh ~= średnia moc kW
-    if "source_pv_kwh" in sim.columns and sim["source_pv_kwh"].sum() > 0:
-        # Plik zawiera rzeczywistą/symulowaną produkcję PV godzinową.
-        # Skalujemy ją do wybranej mocy PV, wyznaczając moc bazową z rocznej produkcji i założonego uzysku.
+
+    has_file_pv = "source_pv_kwh" in sim.columns and sim["source_pv_kwh"].sum() > 0
+    has_file_export = "source_export_kwh" in sim.columns and sim["source_export_kwh"].sum() >= 0 and sim.get("source_export_kwh", pd.Series(dtype=float)).sum() > 0
+    pv_mode = getattr(bess, "pv_mode", "Auto")
+
+    if pv_mode == "Auto":
+        # Dla plików PVsyst / z kolumną produkcji PV domyślnie NIE generujemy PV syntetycznie
+        # i NIE skalujemy profilu. To daje SC zgodne z profilem technicznym.
+        pv_mode_effective = "Z pliku — bez skalowania (PVsyst)" if has_file_pv else "Syntetyczna PV z uzysku"
+    else:
+        pv_mode_effective = pv_mode
+
+    if has_file_pv and pv_mode_effective == "Z pliku — bez skalowania (PVsyst)":
+        pv = sim["source_pv_kwh"].to_numpy(dtype=float)
+    elif has_file_pv and pv_mode_effective == "Z pliku — skaluj do mocy PV":
+        # Skalowanie jest pomocne do scenariuszy „co jeśli”, ale może dawać rozjazd z PVsyst.
         base_pv_kwp = sim["source_pv_kwh"].sum() / max(annual_yield, 1)
         pv = sim["source_pv_kwh"].to_numpy(dtype=float) * (pv_kwp / base_pv_kwp if base_pv_kwp > 0 else 1.0)
     else:
         pv = synthetic_pv_profile(sim, pv_kwp, annual_yield)
+
     dt_h = 1.0
     eta = np.sqrt(max(min(bess.roundtrip_eff, 1.0), 0.01))
 
-    direct = np.minimum(load, pv)
-    pv_surplus = np.maximum(pv - load, 0)
-    residual_load = np.maximum(load - pv, 0)
+    # Tryb PVsyst: jeżeli plik ma kolumnę eksportu/wprowadzenia do sieci, traktujemy ją jako
+    # technicznie policzoną nadwyżkę. Wtedy SC przed BESS = (PV - eksport z PVsyst) / PV.
+    if has_file_pv and has_file_export and pv_mode_effective == "Z pliku — bez skalowania (PVsyst)":
+        file_export = np.minimum(sim["source_export_kwh"].to_numpy(dtype=float), pv)
+        direct = np.maximum(pv - file_export, 0)
+        pv_surplus = file_export.copy()
+        residual_load = np.maximum(load - direct, 0)
+    else:
+        direct = np.minimum(load, pv)
+        pv_surplus = np.maximum(pv - load, 0)
+        residual_load = np.maximum(load - pv, 0)
+
+    sc_before_bess = direct.sum() / pv.sum() if pv.sum() > 0 else 0
 
     soc = bess.capacity_kwh * bess.initial_soc_pct / 100 if bess.capacity_kwh > 0 else 0
     min_soc = bess.capacity_kwh * bess.min_soc_pct / 100 if bess.capacity_kwh > 0 else 0
@@ -480,6 +505,8 @@ def simulate_pv_bess(
         clipped_peak[i] = max(0, grid_before_bess[i] - grid_after[i])
 
     sim["pv_kwh"] = pv
+    sim["pv_mode"] = pv_mode_effective
+    sim["sc_before_bess_pct_hourly"] = sc_before_bess * 100
     sim["direct_self_kwh"] = direct
     sim["pv_surplus_kwh"] = pv_surplus
     sim["grid_before_bess_kwh"] = grid_before_bess
@@ -513,7 +540,9 @@ def simulate_pv_bess(
         "load_mwh": load.sum() / 1000,
         "pv_mwh": pv_total / 1000,
         "direct_self_mwh": pv_used_direct / 1000,
+        "autokonsumpcja_przed_bess_pct": sc_before_bess * 100,
         "autokonsumpcja_pct": autokonsumpcja * 100,
+        "pv_mode_effective": pv_mode_effective,
         "export_potential_mwh": export_potential / 1000,
         "export_after_bess_mwh": export_after / 1000,
         "export_reduction_mwh": export_reduction / 1000,
@@ -606,6 +635,7 @@ def optimize_variants(df, annual_yield, params, min_sc=80.0):
                 initial_soc_pct=params.get("initial_soc_pct", 50),
                 min_soc_pct=params.get("min_soc_pct", 10),
                 mode=params.get("bess_mode", "Peak shaving priority"),
+                pv_mode=params.get("pv_mode", "Auto"),
             )
             _, m = simulate_pv_bess(df, pv, annual_yield, bess, peak_target)
             f = financials(m, pv, bess, params)
@@ -624,6 +654,12 @@ with st.sidebar:
     st.subheader("Założenia techniczne")
     pv_kwp = st.number_input("Moc PV [kWp]", 10, 10000, 1200, 10)
     annual_yield = st.number_input("Uzysk PV [kWh/kWp/rok]", 700, 1300, 1050, 10)
+    pv_mode = st.selectbox(
+        "Sposób liczenia profilu PV / SC",
+        ["Auto", "Z pliku — bez skalowania (PVsyst)", "Z pliku — skaluj do mocy PV", "Syntetyczna PV z uzysku"],
+        index=0,
+        help="Dla porównania z działem technicznym wybierz/pozostaw tryb PVsyst: produkcja PV i eksport są brane godzinowo z pliku, bez syntetycznego profilu."
+    )
     bess_capacity = st.number_input("Pojemność BESS [kWh]", 0, 10000, 500, 50)
     bess_power = st.number_input("Moc BESS [kW]", 0, 10000, 500, 50)
     bess_eff = st.slider("Sprawność round-trip BESS [%]", 70, 98, 90)
@@ -682,6 +718,14 @@ try:
     if import_mode.startswith("Auto"):
         df = load_profile_auto(uploaded)
         st.success(f"Plik odczytany automatycznie: {len(df):,} rekordów, {df['load_kwh'].sum()/1000:,.2f} MWh zużycia.".replace(",", " "))
+        if "source_pv_kwh" in df.columns:
+            msg = f"Wykryto produkcję PV w pliku: {df['source_pv_kwh'].sum()/1000:,.2f} MWh".replace(",", " ")
+            if "source_export_kwh" in df.columns:
+                exp = df['source_export_kwh'].sum()/1000
+                pvsum = df['source_pv_kwh'].sum()
+                sc = (1 - df['source_export_kwh'].sum()/pvsum) * 100 if pvsum > 0 else 0
+                msg += f" | eksport z pliku: {exp:,.2f} MWh | SC wg pliku/PVsyst: {sc:.1f}%".replace(",", " ")
+            st.info(msg)
         with st.expander("Podgląd znormalizowanych danych"):
             st.dataframe(df.head(50), use_container_width=True)
     else:
@@ -746,22 +790,25 @@ params = {
     "initial_soc_pct": initial_soc,
     "min_soc_pct": min_soc,
     "peak_target_kw": peak_target,
+    "pv_mode": pv_mode,
 }
 
-bess = BessConfig(bess_capacity, bess_power, bess_eff / 100, initial_soc, min_soc, bess_mode)
+bess = BessConfig(bess_capacity, bess_power, bess_eff / 100, initial_soc, min_soc, bess_mode, pv_mode)
 sim, metrics = simulate_pv_bess(df, pv_kwp, annual_yield, bess, peak_target)
 fin = financials(metrics, pv_kwp, bess, params)
 
 kpi = {**metrics, **fin}
 
 st.subheader("Podsumowanie wariantu")
-cols = st.columns(6)
+st.caption(f"Tryb PV użyty w obliczeniach: {kpi.get('pv_mode_effective', '—')}")
+cols = st.columns(7)
 cols[0].metric("Zużycie", f"{kpi['load_mwh']:,.0f} MWh".replace(",", " "))
 cols[1].metric("Produkcja PV", f"{kpi['pv_mwh']:,.0f} MWh".replace(",", " "))
-cols[2].metric("Autokonsumpcja", f"{kpi['autokonsumpcja_pct']:.1f}%", "cel min. 80%")
-cols[3].metric("Eksport/potencjał BESS", f"{kpi['export_potential_mwh']:,.0f} MWh".replace(",", " "))
-cols[4].metric("Redukcja peak", f"{kpi['peak_reduction_kw']:.0f} kW")
-cols[5].metric("Korzyść roczna", f"{kpi['annual_benefit_pln']:,.0f} PLN".replace(",", " "))
+cols[2].metric("SC przed BESS", f"{kpi['autokonsumpcja_przed_bess_pct']:.1f}%")
+cols[3].metric("SC po BESS", f"{kpi['autokonsumpcja_pct']:.1f}%", "cel min. 80%")
+cols[4].metric("Eksport/potencjał BESS", f"{kpi['export_potential_mwh']:,.0f} MWh".replace(",", " "))
+cols[5].metric("Redukcja peak", f"{kpi['peak_reduction_kw']:.0f} kW")
+cols[6].metric("Korzyść roczna", f"{kpi['annual_benefit_pln']:,.0f} PLN".replace(",", " "))
 
 cols2 = st.columns(5)
 cols2[0].metric("CAPEX", f"{kpi['capex_pln']:,.0f} PLN".replace(",", " "))
