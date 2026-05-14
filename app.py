@@ -720,6 +720,28 @@ def split_profiles_by_ppe(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         profiles[ppe] = prof
     return profiles
 
+def _max_pv_for_sc(prof: pd.DataFrame, annual_yield: float, bess: BessConfig, peak_target: float, min_sc_pct: float, pv_max: int, metric_key: str):
+    """Zwraca największą moc PV, dla której wskazany wskaźnik SC >= cel.
+
+    metric_key:
+    - autokonsumpcja_przed_bess_pct = SC klasyczne/PVsyst bez magazynu
+    - autokonsumpcja_pct = SC po BESS
+    """
+    best_pv = 0
+    best_m = None
+    for pv in range(1, pv_max + 1):
+        _, m = simulate_pv_bess(prof, pv, annual_yield, bess, peak_target)
+        if m.get(metric_key, 0) >= min_sc_pct:
+            best_pv = pv
+            best_m = m
+        else:
+            # Dla stałego profilu i rosnącej mocy PV SC zasadniczo maleje.
+            # Przerywamy dopiero po znalezieniu wariantu spełniającego, żeby nie zwrócić sztucznie 0.
+            if best_pv > 0:
+                break
+    return best_pv, best_m
+
+
 def find_pv_size_for_min_sc(
     profiles: Dict[str, pd.DataFrame],
     annual_yield: float,
@@ -728,68 +750,47 @@ def find_pv_size_for_min_sc(
     params: Dict[str, float],
     min_sc_pct: float = 80.0,
 ) -> pd.DataFrame:
-    """Dla każdego PPE wyznacza indywidualną maksymalną moc PV spełniającą warunek SC >= min_sc_pct.
+    """Dla każdego PPE wyznacza indywidualną moc PV spełniającą SC >= cel.
 
-    Ważne: nie korzystamy z pv_min_kwp jako dolnej granicy, bo przy wysokim minimum
-    optimizer może błędnie zwracać np. 500 kWp mimo SC < 80%. Tu szukamy realnego
-    progu od małych mocy PV do pv_max_kwp osobno dla każdego PPE.
+    W v15 pokazujemy dwie wartości, bo to było główne źródło rozjazdów:
+    1) SC bez BESS / jak w PVsyst: energia PV zużyta bezpośrednio / produkcja PV.
+    2) SC po BESS: produkcja PV niewyeksportowana po pracy magazynu / produkcja PV.
+
+    Do porównania z działem technicznym i PVsyst zwykle patrzymy na kolumnę
+    „PV max dla SC bez BESS >=80%”.
     """
     rows = []
     pv_max = int(max(1, params.get("pv_max_kwp", 3000)))
-    # Dokładność doboru. 1 kWp daje jednoznaczny wynik, a przy kilku PPE nadal jest akceptowalne.
-    fine_step = 1
-
-    def metrics_for(prof: pd.DataFrame, pv_kwp: float):
-        _, m = simulate_pv_bess(prof, pv_kwp, annual_yield, bess, peak_target)
-        return m
 
     for ppe, prof in profiles.items():
-        # Jeśli już 1 kWp nie spełnia warunku, oznaczamy brak sensownego wariantu.
-        m_low = metrics_for(prof, 1)
-        if m_low["autokonsumpcja_pct"] < min_sc_pct:
-            rows.append({
-                "PPE": ppe,
-                "PV dla SC >= 80% [kWp]": 0,
-                "SC przed BESS [%]": m_low["autokonsumpcja_przed_bess_pct"],
-                "SC po BESS [%]": m_low["autokonsumpcja_pct"],
-                "PV [MWh/rok]": m_low["pv_mwh"],
-                "Eksport po BESS [MWh/rok]": m_low["export_after_bess_mwh"],
-                "Peak po [kW]": m_low["peak_after_kw"],
-                "Status": "Brak wariantu — nawet 1 kWp ma SC < celu",
-            })
-            continue
+        pv_before, m_before = _max_pv_for_sc(
+            prof, annual_yield, bess, peak_target, min_sc_pct, pv_max, "autokonsumpcja_przed_bess_pct"
+        )
+        pv_after, m_after = _max_pv_for_sc(
+            prof, annual_yield, bess, peak_target, min_sc_pct, pv_max, "autokonsumpcja_pct"
+        )
 
-        # Szukamy największej mocy PV, dla której SC po BESS nadal >= cel.
-        # SC zwykle maleje wraz ze wzrostem PV, ale dla bezpieczeństwa skanujemy pełny zakres.
-        best_pv = 1
-        best_m = m_low
-        crossed = False
-        for pv in range(1 + fine_step, pv_max + 1, fine_step):
-            m = metrics_for(prof, pv)
-            if m["autokonsumpcja_pct"] >= min_sc_pct:
-                best_pv = pv
-                best_m = m
-            else:
-                # Przy syntetycznym profilu PV i stałym BESS po pierwszym zejściu poniżej celu
-                # dalsze zwiększanie PV zasadniczo będzie pogarszać SC, więc można przerwać.
-                crossed = True
-                break
+        if m_before is None:
+            _, m1 = simulate_pv_bess(prof, 1, annual_yield, bess, peak_target)
+            m_before = m1
+        if m_after is None:
+            _, m1 = simulate_pv_bess(prof, 1, annual_yield, bess, peak_target)
+            m_after = m1
 
-        status = "OK"
-        if not crossed and best_pv >= pv_max:
-            status = "OK — cel spełniony aż do górnego zakresu PV"
-
+        load_mwh = prof["load_kwh"].sum() / 1000 if "load_kwh" in prof.columns else np.nan
         rows.append({
             "PPE": ppe,
-            "PV dla SC >= 80% [kWp]": float(best_pv),
-            "SC przed BESS [%]": best_m["autokonsumpcja_przed_bess_pct"],
-            "SC po BESS [%]": best_m["autokonsumpcja_pct"],
-            "PV [MWh/rok]": best_m["pv_mwh"],
-            "Eksport po BESS [MWh/rok]": best_m["export_after_bess_mwh"],
-            "Peak po [kW]": best_m["peak_after_kw"],
-            "Status": status,
+            "Zużycie PPE [MWh/rok]": load_mwh,
+            "PV max dla SC bez BESS >=80% [kWp]": float(pv_before),
+            "SC bez BESS przy tej PV [%]": m_before.get("autokonsumpcja_przed_bess_pct", np.nan),
+            "Eksport bez BESS [MWh/rok]": m_before.get("export_potential_mwh", np.nan),
+            "PV max dla SC po BESS >=80% [kWp]": float(pv_after),
+            "SC po BESS przy tej PV [%]": m_after.get("autokonsumpcja_pct", np.nan),
+            "Eksport po BESS [MWh/rok]": m_after.get("export_after_bess_mwh", np.nan),
+            "Status": "OK" if pv_before > 0 else "Brak wariantu w zakresie — nawet 1 kWp nie spełnia celu",
         })
-    return pd.DataFrame(rows).sort_values("PV dla SC >= 80% [kWp]", ascending=False)
+    return pd.DataFrame(rows).sort_values("PV max dla SC bez BESS >=80% [kWp]", ascending=False)
+
 
 def build_ppe_summary(profiles: Dict[str, pd.DataFrame], pv_kwp: float, annual_yield: float, bess: BessConfig, peak_target: float, params: Dict[str, float]) -> pd.DataFrame:
     """Liczy szybkie KPI dla każdego PPE tymi samymi założeniami technicznymi i finansowymi."""
@@ -1020,13 +1021,19 @@ if ppe_profiles:
 
     st.subheader("Dobór PV per PPE — cel SC ≥ 80%")
     st.caption(
-        "Tabela pokazuje indywidualnie wyznaczoną maksymalną moc PV dla każdego PPE, przy której SC po BESS jest nadal ≥ 80%. "
+        "Tabela pokazuje dwie wartości: moc PV dla SC bez BESS/PVsyst ≥ 80% oraz osobno moc PV dla SC po BESS ≥ 80%. Do porównania z działem technicznym używaj przede wszystkim kolumny „SC bez BESS”. "
         "Dolna granica nie bierze pv_min z Optimizera — algorytm szuka progu od 1 kWp do PV max z dokładnością 1 kWp. BESS liczony jest według aktualnych ustawień."
     )
     pv_sc_table = find_pv_size_for_min_sc(ppe_profiles, annual_yield, bess, peak_target, params, min_sc_pct=80.0)
     st.dataframe(
         pv_sc_table.style.format({
-            "PV dla SC >= 80% [kWp]": "{:.0f}",
+            "Zużycie PPE [MWh/rok]": "{:.1f}",
+            "PV max dla SC bez BESS >=80% [kWp]": "{:.0f}",
+            "SC bez BESS przy tej PV [%]": "{:.1f}",
+            "Eksport bez BESS [MWh/rok]": "{:.1f}",
+            "PV max dla SC po BESS >=80% [kWp]": "{:.0f}",
+            "SC po BESS przy tej PV [%]": "{:.1f}",
+            "Eksport po BESS [MWh/rok]": "{:.1f}",
             "SC przed BESS [%]": "{:.1f}",
             "SC po BESS [%]": "{:.1f}",
             "PV [MWh/rok]": "{:.2f}",
@@ -1041,10 +1048,10 @@ if ppe_profiles:
     fig_pv_sc = px.bar(
         pv_sc_table,
         x="PPE",
-        y="PV dla SC >= 80% [kWp]",
+        y="PV max dla SC bez BESS >=80% [kWp]",
         color="Status",
         hover_data=["SC po BESS [%]", "PV [MWh/rok]", "Eksport po BESS [MWh/rok]"],
-        title="Indywidualna moc PV przy SC ≥ 80% — osobno dla każdego PPE"
+        title="Indywidualna moc PV przy SC bez BESS ≥ 80% — osobno dla każdego PPE"
     )
     st.plotly_chart(fig_pv_sc, use_container_width=True)
 
