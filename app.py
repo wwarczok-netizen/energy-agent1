@@ -223,6 +223,7 @@ def normalize_profile_manual(
     time_col: str = "— brak —",
     pv_col: str = "— brak —",
     export_col: str = "— brak —",
+    ppe_col: str = "— brak —",
     unit: str = "kWh",
     aggregate_hourly: bool = True,
 ) -> pd.DataFrame:
@@ -240,6 +241,8 @@ def normalize_profile_manual(
         out["source_pv_kwh"] = raw_df[pv_col].map(parse_number_pl) * multiplier
     if export_col and export_col != "— brak —":
         out["source_export_kwh"] = raw_df[export_col].map(parse_number_pl) * multiplier
+    if ppe_col and ppe_col != "— brak —":
+        out["ppe_id"] = raw_df[ppe_col].astype(str).str.strip()
 
     out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
     if aggregate_hourly:
@@ -258,13 +261,13 @@ def enrich_time_columns(out: pd.DataFrame) -> pd.DataFrame:
 def aggregate_energy_by_hour(out: pd.DataFrame, ppe_col: str = None) -> pd.DataFrame:
     """Finalizuje profil energii.
 
-    Kluczowe dla plików z wieloma PPE w jednym ciągu rekordów:
+    Ważne dla multi-PPE:
     - timestampy typu 00:59/01:59 są sprowadzane do początku godziny,
-    - wszystkie rekordy z tą samą godziną są sumowane,
-    - opcjonalna kolumna PPE służy tylko do diagnostyki, nie do obliczeń SC.
+    - jeżeli wykryto PPE/licznik, dane są agregowane OSOBNO dla każdego PPE,
+    - aplikacja nie sumuje PPE automatycznie do jednego profilu zakładu.
 
-    Dzięki temu 4 PPE zapisane jako 4 serie po 8760 rekordów tworzą jeden
-    profil zakładu: jedna godzina = suma poboru wszystkich PPE.
+    Sumowanie wielu PPE powinno być osobnym, świadomym trybem, bo SC/PV/BESS
+    dla każdego PPE może być inna i nie zawsze istnieje wspólny bilans energii.
     """
     out = out.copy()
     out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
@@ -278,12 +281,19 @@ def aggregate_energy_by_hour(out: pd.DataFrame, ppe_col: str = None) -> pd.DataF
     rows_per_hour = out.groupby("timestamp").size() if raw_rows else pd.Series(dtype=int)
     ppe_count = out["ppe_id"].nunique() if "ppe_id" in out.columns else None
 
-    grouped = out.groupby("timestamp", as_index=False)[value_cols].sum()
+    if "ppe_id" in out.columns and ppe_count and ppe_count > 1:
+        grouped = out.groupby(["ppe_id", "timestamp"], as_index=False)[value_cols].sum()
+        grouped.attrs["multi_ppe_mode"] = "separate"
+    else:
+        grouped = out.groupby("timestamp", as_index=False)[value_cols].sum()
+        grouped.attrs["multi_ppe_mode"] = "single"
+
     grouped.attrs["raw_rows_before_hourly_aggregation"] = raw_rows
     grouped.attrs["unique_hours_after_aggregation"] = int(unique_hours)
     grouped.attrs["max_records_per_hour_before_aggregation"] = int(rows_per_hour.max()) if len(rows_per_hour) else 0
     grouped.attrs["ppe_count_detected"] = int(ppe_count) if ppe_count is not None else None
     grouped.attrs["multi_ppe_or_duplicate_hours_detected"] = bool((rows_per_hour.max() if len(rows_per_hour) else 0) > 1)
+    grouped.attrs["multi_ppe_detected"] = bool(ppe_count and ppe_count > 1)
     return enrich_time_columns(grouped)
 
 
@@ -681,6 +691,44 @@ def optimize_variants(df, annual_yield, params, min_sc=80.0):
     return res.sort_values(["spełnia 80% SC", "net_cash_pln"], ascending=[False, False])
 
 
+
+def split_profiles_by_ppe(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Zwraca profile osobno dla każdego PPE, bez sumowania między PPE."""
+    if "ppe_id" not in df.columns or df["ppe_id"].nunique() <= 1:
+        return {}
+    profiles = {}
+    for ppe, part in df.groupby("ppe_id"):
+        p = part.drop(columns=["ppe_id"], errors="ignore").copy().sort_values("timestamp").reset_index(drop=True)
+        profiles[str(ppe)] = p
+    return profiles
+
+
+def build_ppe_summary(profiles: Dict[str, pd.DataFrame], pv_kwp: float, annual_yield: float, bess: BessConfig, peak_target: float, params: Dict[str, float]) -> pd.DataFrame:
+    """Liczy szybkie KPI dla każdego PPE tymi samymi założeniami technicznymi i finansowymi."""
+    rows = []
+    for ppe, prof in profiles.items():
+        sim_i, m = simulate_pv_bess(prof, pv_kwp, annual_yield, bess, peak_target)
+        f = financials(m, pv_kwp, bess, params)
+        rows.append({
+            "PPE": ppe,
+            "Godziny": len(prof),
+            "Zużycie [MWh]": m["load_mwh"],
+            "PV [MWh]": m["pv_mwh"],
+            "SC przed BESS [%]": m["autokonsumpcja_przed_bess_pct"],
+            "SC po BESS [%]": m["autokonsumpcja_pct"],
+            "Eksport/potencjał BESS [MWh]": m["export_potential_mwh"],
+            "Eksport po BESS [MWh]": m["export_after_bess_mwh"],
+            "Peak przed [kW]": m["peak_before_kw"],
+            "Peak po [kW]": m["peak_after_kw"],
+            "Redukcja peak [kW]": m["peak_reduction_kw"],
+            "Korzyść roczna [PLN]": f["annual_benefit_pln"],
+            "ROI [%]": f["roi_pct"],
+            "IRR [%]": f["irr_pct"],
+            "DSCR": f["dscr"],
+            "CAPEX [PLN]": f["capex_pln"],
+        })
+    return pd.DataFrame(rows).sort_values("Zużycie [MWh]", ascending=False)
+
 st.title("Energy Agent MVP — dobór PV + BESS")
 st.caption("MVP: autokonsumpcja, eksport jako potencjał BESS, godzinowy model SoC magazynu, peak shaving, ROI, IRR, DSCR, SaaS/CAPEX, opłata mocowa. Bez arbitrażu cenowego.")
 
@@ -753,17 +801,26 @@ import_mode = st.radio(
 try:
     if import_mode.startswith("Auto"):
         df = load_profile_auto(uploaded)
-        st.success(f"Plik odczytany automatycznie: {len(df):,} godzin po agregacji, {df['load_kwh'].sum()/1000:,.2f} MWh zużycia.".replace(",", " "))
-        if df.attrs.get("multi_ppe_or_duplicate_hours_detected"):
-            ppe_txt = df.attrs.get("ppe_count_detected")
-            ppe_part = f" | wykryte PPE/liczniki: {ppe_txt}" if ppe_txt else ""
+        unique_profiles = df["ppe_id"].nunique() if "ppe_id" in df.columns else 1
+        st.success(f"Plik odczytany automatycznie: {len(df):,} rekordów po agregacji godzinowej, {df['load_kwh'].sum()/1000:,.2f} MWh zużycia.".replace(",", " "))
+        if df.attrs.get("multi_ppe_detected"):
             st.info(
                 (
-                    f"Wykryto wiele rekordów dla tych samych godzin — aplikacja zsumowała je do jednego profilu zakładu. "
+                    f"Wykryto kilka PPE/liczników: {unique_profiles}. "
+                    f"Aplikacja NIE sumuje ich automatycznie — poniżej pokaże wynik dla każdego PPE osobno. "
+                    f"Rekordy przed agregacją: {df.attrs.get('raw_rows_before_hourly_aggregation')} | "
+                    f"rekordy po agregacji PPE×godzina: {len(df)} | "
+                    f"unikalne godziny w pliku: {df.attrs.get('unique_hours_after_aggregation')}"
+                )
+            )
+        elif df.attrs.get("multi_ppe_or_duplicate_hours_detected"):
+            st.info(
+                (
+                    f"Wykryto duplikaty/rekordy częściowe dla tych samych godzin. "
+                    f"Zostały zsumowane w ramach tego samego profilu. "
                     f"Rekordy przed agregacją: {df.attrs.get('raw_rows_before_hourly_aggregation')} | "
                     f"godziny po agregacji: {df.attrs.get('unique_hours_after_aggregation')} | "
                     f"maks. rekordów w jednej godzinie: {df.attrs.get('max_records_per_hour_before_aggregation')}"
-                    f"{ppe_part}"
                 )
             )
         if "source_pv_kwh" in df.columns:
@@ -805,9 +862,11 @@ try:
             export_options = [none_option] + cols_raw
             pv_col = st.selectbox("Opcjonalna kolumna produkcji PV", pv_options, index=pv_options.index(pv_guess) if pv_guess in pv_options else 0)
             export_col = st.selectbox("Opcjonalna kolumna eksportu", export_options, index=export_options.index(export_guess) if export_guess in export_options else 0)
+            ppe_guess = guess_column(cols_raw, ["ppe", "punkt poboru", "nr punktu", "kod ppe", "licznik", "meter"], [])
+            ppe_col = st.selectbox("Opcjonalna kolumna PPE/licznika", [none_option] + cols_raw, index=([none_option] + cols_raw).index(ppe_guess) if ppe_guess in cols_raw else 0)
 
         aggregate_hourly = st.checkbox("Agreguj dane do godzin", value=True, help="Włączone: 15-minutówki zostaną zsumowane do danych godzinowych.")
-        df = normalize_profile_manual(raw_df, date_col, load_col, time_col, pv_col, export_col, unit, aggregate_hourly)
+        df = normalize_profile_manual(raw_df, date_col, load_col, time_col, pv_col, export_col, ppe_col, unit, aggregate_hourly)
         st.success(f"Profil zmapowany: {len(df):,} rekordów, {df['load_kwh'].sum()/1000:,.2f} MWh zużycia.".replace(",", " "))
         with st.expander("Podgląd znormalizowanych danych"):
             st.dataframe(df.head(50), use_container_width=True)
@@ -842,6 +901,49 @@ params = {
 }
 
 bess = BessConfig(bess_capacity, bess_power, bess_eff / 100, initial_soc, min_soc, bess_mode, pv_mode)
+
+# Multi-PPE: pokazujemy wynik dla każdego PPE osobno i dopiero potem pozwalamy wybrać jeden PPE do szczegółowych wykresów.
+ppe_profiles = split_profiles_by_ppe(df)
+if ppe_profiles:
+    st.subheader("Multi-PPE — wyniki osobno dla każdego punktu poboru")
+    st.caption("Aplikacja nie sumuje PPE automatycznie. Każdy PPE liczony jest oddzielnie tymi samymi założeniami PV/BESS/finansowymi.")
+    ppe_summary = build_ppe_summary(ppe_profiles, pv_kwp, annual_yield, bess, peak_target, params)
+    st.dataframe(
+        ppe_summary.style.format({
+            "Zużycie [MWh]": "{:.2f}",
+            "PV [MWh]": "{:.2f}",
+            "SC przed BESS [%]": "{:.1f}",
+            "SC po BESS [%]": "{:.1f}",
+            "Eksport/potencjał BESS [MWh]": "{:.2f}",
+            "Eksport po BESS [MWh]": "{:.2f}",
+            "Peak przed [kW]": "{:.0f}",
+            "Peak po [kW]": "{:.0f}",
+            "Redukcja peak [kW]": "{:.0f}",
+            "Korzyść roczna [PLN]": "{:,.0f}",
+            "ROI [%]": "{:.1f}",
+            "IRR [%]": "{:.1f}",
+            "DSCR": "{:.2f}",
+            "CAPEX [PLN]": "{:,.0f}",
+        }),
+        use_container_width=True
+    )
+    csv_ppe = ppe_summary.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Pobierz wyniki PPE do CSV", csv_ppe, "wyniki_multi_ppe.csv", "text/csv")
+
+    fig_ppe = px.bar(
+        ppe_summary,
+        x="PPE",
+        y="SC po BESS [%]",
+        hover_data=["Zużycie [MWh]", "Eksport po BESS [MWh]", "Redukcja peak [kW]", "ROI [%]"],
+        title="Autokonsumpcja po BESS — porównanie PPE"
+    )
+    fig_ppe.add_hline(y=80, line_dash="dash", annotation_text="Cel 80% SC")
+    st.plotly_chart(fig_ppe, use_container_width=True)
+
+    selected_ppe = st.selectbox("Wybierz PPE do szczegółowych wykresów poniżej", list(ppe_profiles.keys()))
+    df = ppe_profiles[selected_ppe]
+    st.info(f"Szczegółowy dashboard poniżej pokazuje wyłącznie PPE: {selected_ppe}")
+
 sim, metrics = simulate_pv_bess(df, pv_kwp, annual_yield, bess, peak_target)
 fin = financials(metrics, pv_kwp, bess, params)
 
