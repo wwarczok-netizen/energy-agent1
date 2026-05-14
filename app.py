@@ -57,7 +57,7 @@ def load_pvsyst_export(text: str) -> pd.DataFrame:
     out["source_pv_kwh"] = pd.to_numeric(tmp["pv_kwh"].astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0)
     out["source_export_kwh"] = pd.to_numeric(tmp["export_kwh"].astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0)
     out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    return enrich_time_columns(out)
+    return aggregate_energy_by_hour(out)
 
 
 def load_csv(uploaded_file) -> pd.DataFrame:
@@ -242,10 +242,8 @@ def normalize_profile_manual(
         out["source_export_kwh"] = raw_df[export_col].map(parse_number_pl) * multiplier
 
     out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
-    value_cols = [c for c in out.columns if c != "timestamp"]
     if aggregate_hourly:
-        out["timestamp"] = out["timestamp"].dt.floor("h")
-    out = out.groupby("timestamp", as_index=False)[value_cols].sum()
+        return aggregate_energy_by_hour(out)
     return enrich_time_columns(out)
 
 def enrich_time_columns(out: pd.DataFrame) -> pd.DataFrame:
@@ -255,6 +253,38 @@ def enrich_time_columns(out: pd.DataFrame) -> pd.DataFrame:
     out["weekday"] = out["timestamp"].dt.dayofweek
     out["is_sunday"] = out["weekday"].eq(6)
     return out
+
+
+def aggregate_energy_by_hour(out: pd.DataFrame, ppe_col: str = None) -> pd.DataFrame:
+    """Finalizuje profil energii.
+
+    Kluczowe dla plików z wieloma PPE w jednym ciągu rekordów:
+    - timestampy typu 00:59/01:59 są sprowadzane do początku godziny,
+    - wszystkie rekordy z tą samą godziną są sumowane,
+    - opcjonalna kolumna PPE służy tylko do diagnostyki, nie do obliczeń SC.
+
+    Dzięki temu 4 PPE zapisane jako 4 serie po 8760 rekordów tworzą jeden
+    profil zakładu: jedna godzina = suma poboru wszystkich PPE.
+    """
+    out = out.copy()
+    out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
+    # Profile OSD często opisują godzinę końcem interwału, np. 00:59.
+    # Do symulacji PV/BESS potrzebujemy wspólnego indeksu godzinowego.
+    out["timestamp"] = out["timestamp"].dt.floor("h")
+
+    value_cols = [c for c in out.columns if c not in {"timestamp", "ppe_id"}]
+    raw_rows = len(out)
+    unique_hours = out["timestamp"].nunique()
+    rows_per_hour = out.groupby("timestamp").size() if raw_rows else pd.Series(dtype=int)
+    ppe_count = out["ppe_id"].nunique() if "ppe_id" in out.columns else None
+
+    grouped = out.groupby("timestamp", as_index=False)[value_cols].sum()
+    grouped.attrs["raw_rows_before_hourly_aggregation"] = raw_rows
+    grouped.attrs["unique_hours_after_aggregation"] = int(unique_hours)
+    grouped.attrs["max_records_per_hour_before_aggregation"] = int(rows_per_hour.max()) if len(rows_per_hour) else 0
+    grouped.attrs["ppe_count_detected"] = int(ppe_count) if ppe_count is not None else None
+    grouped.attrs["multi_ppe_or_duplicate_hours_detected"] = bool((rows_per_hour.max() if len(rows_per_hour) else 0) > 1)
+    return enrich_time_columns(grouped)
 
 
 def normalize_profile(df: pd.DataFrame) -> pd.DataFrame:
@@ -348,13 +378,19 @@ def normalize_profile(df: pd.DataFrame) -> pd.DataFrame:
     if export_col is not None:
         out["source_export_kwh"] = df[export_col].map(parse_number_pl)
 
+    # 4) Opcjonalna kolumna PPE/licznika — tylko diagnostyka.
+    ppe_col = None
+    ppe_keywords = ["ppe", "punkt poboru", "nr punktu", "kod ppe", "licznik", "meter", "metering"]
+    for c in df.columns:
+        cl = str(c).lower()
+        if any(k in cl for k in ppe_keywords):
+            ppe_col = c
+            break
+    if ppe_col is not None:
+        out["ppe_id"] = df[ppe_col].astype(str)
+
     out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-
-    # Usunięcie ewentualnych duplikatów timestamp przez sumowanie energii.
-    value_cols = [c for c in out.columns if c != "timestamp"]
-    out = out.groupby("timestamp", as_index=False)[value_cols].sum()
-
-    return enrich_time_columns(out)
+    return aggregate_energy_by_hour(out, ppe_col=ppe_col)
 
 def synthetic_pv_profile(df: pd.DataFrame, pv_kwp: float, annual_yield_kwh_kwp: float) -> np.ndarray:
     ts = df["timestamp"]
@@ -717,7 +753,19 @@ import_mode = st.radio(
 try:
     if import_mode.startswith("Auto"):
         df = load_profile_auto(uploaded)
-        st.success(f"Plik odczytany automatycznie: {len(df):,} rekordów, {df['load_kwh'].sum()/1000:,.2f} MWh zużycia.".replace(",", " "))
+        st.success(f"Plik odczytany automatycznie: {len(df):,} godzin po agregacji, {df['load_kwh'].sum()/1000:,.2f} MWh zużycia.".replace(",", " "))
+        if df.attrs.get("multi_ppe_or_duplicate_hours_detected"):
+            ppe_txt = df.attrs.get("ppe_count_detected")
+            ppe_part = f" | wykryte PPE/liczniki: {ppe_txt}" if ppe_txt else ""
+            st.info(
+                (
+                    f"Wykryto wiele rekordów dla tych samych godzin — aplikacja zsumowała je do jednego profilu zakładu. "
+                    f"Rekordy przed agregacją: {df.attrs.get('raw_rows_before_hourly_aggregation')} | "
+                    f"godziny po agregacji: {df.attrs.get('unique_hours_after_aggregation')} | "
+                    f"maks. rekordów w jednej godzinie: {df.attrs.get('max_records_per_hour_before_aggregation')}"
+                    f"{ppe_part}"
+                )
+            )
         if "source_pv_kwh" in df.columns:
             msg = f"Wykryto produkcję PV w pliku: {df['source_pv_kwh'].sum()/1000:,.2f} MWh".replace(",", " ")
             if "source_export_kwh" in df.columns:
