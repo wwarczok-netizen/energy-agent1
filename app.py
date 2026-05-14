@@ -694,6 +694,32 @@ def optimize_variants(df, annual_yield, params, min_sc=80.0):
 
 
 
+
+def split_profiles_by_ppe(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Zwraca słownik profili PPE -> dataframe.
+
+    Jeśli profil nie ma kolumny ppe_id albo jest tylko jeden PPE, zwraca pusty słownik.
+    Dzięki temu główny dashboard działa jak dotychczas dla pojedynczego profilu,
+    a tryb multi-PPE uruchamia się wyłącznie dla wielu punktów poboru.
+    """
+    if df is None or df.empty or "ppe_id" not in df.columns:
+        return {}
+
+    tmp = df.copy()
+    tmp["ppe_id"] = tmp["ppe_id"].astype(str).str.strip()
+    tmp = tmp[tmp["ppe_id"].notna() & (tmp["ppe_id"] != "") & (tmp["ppe_id"].str.lower() != "nan")]
+
+    ppes = sorted(tmp["ppe_id"].unique().tolist())
+    if len(ppes) <= 1:
+        return {}
+
+    profiles = {}
+    for ppe in ppes:
+        prof = tmp[tmp["ppe_id"] == ppe].copy().sort_values("timestamp").reset_index(drop=True)
+        # Zachowujemy ppe_id dla diagnostyki, ale symulacje korzystają z load_kwh/PV/export/timestamp.
+        profiles[ppe] = prof
+    return profiles
+
 def find_pv_size_for_min_sc(
     profiles: Dict[str, pd.DataFrame],
     annual_yield: float,
