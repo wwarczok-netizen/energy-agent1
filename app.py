@@ -692,6 +692,57 @@ def optimize_variants(df, annual_yield, params, min_sc=80.0):
 
 
 
+
+
+def find_pv_size_for_min_sc(
+    profiles: Dict[str, pd.DataFrame],
+    annual_yield: float,
+    bess: BessConfig,
+    peak_target: float,
+    params: Dict[str, float],
+    min_sc_pct: float = 80.0,
+) -> pd.DataFrame:
+    """Dla każdego PPE znajduje największą moc PV z zakresu optymalizatora,
+    dla której autokonsumpcja po BESS jest >= min_sc_pct.
+
+    Uwaga: przy większej PV autokonsumpcja zwykle spada, dlatego biznesowo
+    najbardziej przydatna jest maksymalna moc PV mieszcząca się w warunku SC.
+    """
+    rows = []
+    pv_sizes = np.arange(params["pv_min_kwp"], params["pv_max_kwp"] + 1, params["pv_step_kwp"])
+    for ppe, prof in profiles.items():
+        candidates = []
+        for pv in pv_sizes:
+            _, m = simulate_pv_bess(prof, pv, annual_yield, bess, peak_target)
+            candidates.append({
+                "PV kWp": float(pv),
+                "SC przed BESS [%]": m["autokonsumpcja_przed_bess_pct"],
+                "SC po BESS [%]": m["autokonsumpcja_pct"],
+                "PV [MWh]": m["pv_mwh"],
+                "Eksport po BESS [MWh]": m["export_after_bess_mwh"],
+                "Peak po [kW]": m["peak_after_kw"],
+            })
+        cand = pd.DataFrame(candidates)
+        ok = cand[cand["SC po BESS [%]"] >= min_sc_pct].copy()
+        if len(ok):
+            best = ok.sort_values("PV kWp", ascending=False).iloc[0]
+            status = "OK"
+        else:
+            # Jeżeli żaden wariant nie spełnia 80%, pokazujemy najlepszy osiągnięty SC
+            best = cand.sort_values("SC po BESS [%]", ascending=False).iloc[0]
+            status = "Brak wariantu >= celu w zadanym zakresie"
+        rows.append({
+            "PPE": ppe,
+            "Rekomendowana / maks. PV [kWp]": best["PV kWp"],
+            "SC przed BESS [%]": best["SC przed BESS [%]"],
+            "SC po BESS [%]": best["SC po BESS [%]"],
+            "PV [MWh/rok]": best["PV [MWh]"],
+            "Eksport po BESS [MWh/rok]": best["Eksport po BESS [MWh]"],
+            "Peak po [kW]": best["Peak po [kW]"],
+            "Status": status,
+        })
+    return pd.DataFrame(rows).sort_values("Rekomendowana / maks. PV [kWp]", ascending=False)
+
 def split_profiles_by_ppe(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     """Zwraca profile osobno dla każdego PPE, bez sumowania między PPE."""
     if "ppe_id" not in df.columns or df["ppe_id"].nunique() <= 1:
@@ -929,6 +980,36 @@ if ppe_profiles:
     )
     csv_ppe = ppe_summary.to_csv(index=False).encode("utf-8-sig")
     st.download_button("Pobierz wyniki PPE do CSV", csv_ppe, "wyniki_multi_ppe.csv", "text/csv")
+
+    st.subheader("Dobór PV per PPE — cel SC ≥ 80%")
+    st.caption(
+        "Tabela pokazuje największą moc PV z zakresu Optimizera, dla której dany PPE utrzymuje autokonsumpcję po BESS ≥ 80%. "
+        "Zakres i krok PV bierze z ustawień w sidebarze: Optimizer: PV od/do/krok. BESS liczony jest według aktualnych ustawień pojemności, mocy i trybu pracy."
+    )
+    pv_sc_table = find_pv_size_for_min_sc(ppe_profiles, annual_yield, bess, peak_target, params, min_sc_pct=80.0)
+    st.dataframe(
+        pv_sc_table.style.format({
+            "Rekomendowana / maks. PV [kWp]": "{:.0f}",
+            "SC przed BESS [%]": "{:.1f}",
+            "SC po BESS [%]": "{:.1f}",
+            "PV [MWh/rok]": "{:.2f}",
+            "Eksport po BESS [MWh/rok]": "{:.2f}",
+            "Peak po [kW]": "{:.0f}",
+        }),
+        use_container_width=True
+    )
+    csv_pv_sc = pv_sc_table.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Pobierz dobór PV dla SC ≥ 80% do CSV", csv_pv_sc, "dobor_pv_sc_80_multi_ppe.csv", "text/csv")
+
+    fig_pv_sc = px.bar(
+        pv_sc_table,
+        x="PPE",
+        y="Rekomendowana / maks. PV [kWp]",
+        color="Status",
+        hover_data=["SC po BESS [%]", "PV [MWh/rok]", "Eksport po BESS [MWh/rok]"],
+        title="Maksymalna moc PV przy SC ≥ 80% — osobno dla każdego PPE"
+    )
+    st.plotly_chart(fig_pv_sc, use_container_width=True)
 
     fig_ppe = px.bar(
         ppe_summary,
