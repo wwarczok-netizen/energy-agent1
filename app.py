@@ -818,7 +818,7 @@ def build_ppe_summary(profiles: Dict[str, pd.DataFrame], pv_kwp: float, annual_y
         })
     return pd.DataFrame(rows).sort_values("Zużycie [MWh]", ascending=False)
 
-st.title("Energy Agent MVP — dobór PV + BESS")
+st.title("Energy Agent MVP v16 — dobór PV + BESS")
 st.caption("MVP: autokonsumpcja, eksport jako potencjał BESS, godzinowy model SoC magazynu, peak shaving, ROI, IRR, DSCR, SaaS/CAPEX, opłata mocowa. Bez arbitrażu cenowego.")
 
 with st.sidebar:
@@ -1045,15 +1045,31 @@ if ppe_profiles:
     csv_pv_sc = pv_sc_table.to_csv(index=False).encode("utf-8-sig")
     st.download_button("Pobierz dobór PV dla SC ≥ 80% do CSV", csv_pv_sc, "dobor_pv_sc_80_multi_ppe.csv", "text/csv")
 
-    fig_pv_sc = px.bar(
-        pv_sc_table,
-        x="PPE",
-        y="PV max dla SC bez BESS >=80% [kWp]",
-        color="Status",
-        hover_data=["SC po BESS [%]", "PV [MWh/rok]", "Eksport po BESS [MWh/rok]"],
-        title="Indywidualna moc PV przy SC bez BESS ≥ 80% — osobno dla każdego PPE"
-    )
-    st.plotly_chart(fig_pv_sc, use_container_width=True)
+    # Wykres odporny na brak wariantu/kolumn — Plotly wymaga, aby wszystkie hover_data istniały w tabeli.
+    chart_y_col = "PV max dla SC bez BESS >=80% [kWp]"
+    if chart_y_col in pv_sc_table.columns and "PPE" in pv_sc_table.columns:
+        hover_cols = [
+            c for c in [
+                "Zużycie PPE [MWh/rok]",
+                "SC bez BESS przy tej PV [%]",
+                "Eksport bez BESS [MWh/rok]",
+                "PV max dla SC po BESS >=80% [kWp]",
+                "SC po BESS przy tej PV [%]",
+                "Eksport po BESS [MWh/rok]",
+            ]
+            if c in pv_sc_table.columns
+        ]
+        fig_pv_sc = px.bar(
+            pv_sc_table,
+            x="PPE",
+            y=chart_y_col,
+            color="Status" if "Status" in pv_sc_table.columns else None,
+            hover_data=hover_cols,
+            title="Indywidualna moc PV przy SC bez BESS ≥ 80% — osobno dla każdego PPE"
+        )
+        st.plotly_chart(fig_pv_sc, use_container_width=True)
+    else:
+        st.warning("Nie udało się narysować wykresu doboru PV, ale tabela powyżej pozostaje źródłem wyniku.")
 
     fig_ppe = px.bar(
         ppe_summary,
