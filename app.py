@@ -740,6 +740,60 @@ def financials(metrics: Dict[str, float], pv_kwp: float, bess: BessConfig, param
     }
 
 
+
+def pxx_scenarios(
+    df: pd.DataFrame,
+    pv_kwp: float,
+    annual_yield_p50: float,
+    p90_delta_pct: float,
+    p10_delta_pct: float,
+    bess: BessConfig,
+    peak_target_kw: float,
+    params: Dict[str, float],
+) -> pd.DataFrame:
+    """Liczy scenariusze P90 / P50 / P10 dla tej samej mocy PV, BESS i finansów.
+
+    Interpretacja:
+    - P50: bazowy uzysk PV wpisany w aplikacji,
+    - P90: konserwatywnie niższy uzysk, domyślnie P50 - 10%,
+    - P10: optymistycznie wyższy uzysk, domyślnie P50 + 10%.
+
+    Uwaga: to uproszczony model scenariuszowy dla screeningu handlowego.
+    Nie zastępuje pełnej analizy Pxx z PVsyst / raportu bankowego.
+    """
+    scenario_defs = [
+        ("P90", annual_yield_p50 * (1 - p90_delta_pct / 100)),
+        ("P50", annual_yield_p50),
+        ("P10", annual_yield_p50 * (1 + p10_delta_pct / 100)),
+    ]
+
+    rows = []
+    for label, scen_yield in scenario_defs:
+        sim_s, metrics_s = simulate_pv_bess(df, pv_kwp, scen_yield, bess, peak_target_kw)
+        fin_s = financials(metrics_s, pv_kwp, bess, params)
+
+        rows.append({
+            "Scenariusz": label,
+            "Uzysk [kWh/kWp/rok]": scen_yield,
+            "Produkcja PV [MWh]": metrics_s["pv_mwh"],
+            "SC przed BESS [%]": metrics_s["autokonsumpcja_przed_bess_pct"],
+            "SC po BESS [%]": metrics_s["autokonsumpcja_pct"],
+            "Eksport/potencjał BESS [MWh]": metrics_s["export_potential_mwh"],
+            "Eksport po BESS [MWh]": metrics_s["export_after_bess_mwh"],
+            "Praca BESS [MWh]": metrics_s["bess_discharge_mwh"],
+            "Redukcja peak [kW]": metrics_s["peak_reduction_kw"],
+            "Korzyść roczna [PLN]": fin_s["annual_benefit_pln"],
+            "Net cash [PLN]": fin_s["net_cash_pln"],
+            "ROI [%]": fin_s["roi_pct"],
+            "Payback [lata]": fin_s["payback_years"],
+            "IRR [%]": fin_s["irr_pct"],
+            "DSCR": fin_s["dscr"],
+        })
+
+    return pd.DataFrame(rows)
+
+
+
 def npf_irr(values, guess=0.1):
     # Small dependency-free IRR approximation by binary search
     def npv(rate):
@@ -908,7 +962,7 @@ def build_ppe_summary(profiles: Dict[str, pd.DataFrame], pv_kwp: float, annual_y
         })
     return pd.DataFrame(rows).sort_values("Zużycie [MWh]", ascending=False)
 
-st.title("Energy Agent MVP v16.1 — dobór PV + BESS")
+st.title("Energy Agent MVP v16.2 — dobór PV + BESS + P90/P50/P10")
 st.caption("MVP: autokonsumpcja, eksport jako potencjał BESS, godzinowy model SoC magazynu, peak shaving, ROI, IRR, DSCR, SaaS/CAPEX, opłata mocowa. Bez arbitrażu cenowego.")
 
 with st.sidebar:
@@ -916,7 +970,10 @@ with st.sidebar:
     uploaded = st.file_uploader("Wgraj profil dobowo-godzinowy", type=["csv", "txt", "xlsx", "xls"])
     st.subheader("Założenia techniczne")
     pv_kwp = st.number_input("Moc PV [kWp]", 10, 10000, 1200, 10)
-    annual_yield = st.number_input("Uzysk PV [kWh/kWp/rok]", 700, 1300, 1050, 10)
+    annual_yield = st.number_input("Uzysk PV P50 [kWh/kWp/rok]", 700, 1300, 1050, 10)
+    st.caption("P50 = scenariusz bazowy. P90/P10 liczone są jako odchylenie uzysku względem P50.")
+    p90_delta_pct = st.number_input("P90 — redukcja uzysku względem P50 [%]", 0.0, 30.0, 10.0, 0.5)
+    p10_delta_pct = st.number_input("P10 — wzrost uzysku względem P50 [%]", 0.0, 30.0, 10.0, 0.5)
     pv_mode = st.selectbox(
         "Sposób liczenia profilu PV / SC",
         ["Auto", "Z pliku — bez skalowania (PVsyst)", "Z pliku — skaluj do mocy PV", "Syntetyczna PV z uzysku"],
@@ -1077,6 +1134,8 @@ params = {
     "min_soc_pct": min_soc,
     "peak_target_kw": peak_target,
     "pv_mode": pv_mode,
+    "p90_delta_pct": p90_delta_pct,
+    "p10_delta_pct": p10_delta_pct,
 }
 
 bess = BessConfig(bess_capacity, bess_power, bess_eff / 100, initial_soc, min_soc, bess_mode, pv_mode)
@@ -1204,6 +1263,43 @@ cols3[1].metric("Eksport zredukowany", f"{kpi['export_reduction_mwh']:,.0f} MWh"
 cols3[2].metric("Praca BESS", f"{kpi['bess_discharge_mwh']:,.0f} MWh".replace(",", " "))
 cols3[3].metric("Cykle ekwiwalentne", f"{kpi['bess_equivalent_cycles']:.1f} / rok")
 cols3[4].metric("Śr. SoC", f"{kpi['avg_soc_pct']:.0f}%")
+
+st.subheader("Scenariusze produkcji PV — P90 / P50 / P10")
+st.caption(
+    "P50 to bazowy uzysk wpisany w aplikacji. P90 i P10 są liczone przez zmianę uzysku PV "
+    "o wskazany procent względem P50, przy tej samej mocy PV, BESS i finansach."
+)
+pxx_df = pxx_scenarios(
+    df=df,
+    pv_kwp=pv_kwp,
+    annual_yield_p50=annual_yield,
+    p90_delta_pct=p90_delta_pct,
+    p10_delta_pct=p10_delta_pct,
+    bess=bess,
+    peak_target_kw=peak_target,
+    params=params,
+)
+st.dataframe(
+    pxx_df.style.format({
+        "Uzysk [kWh/kWp/rok]": "{:.0f}",
+        "Produkcja PV [MWh]": "{:.1f}",
+        "SC przed BESS [%]": "{:.1f}",
+        "SC po BESS [%]": "{:.1f}",
+        "Eksport/potencjał BESS [MWh]": "{:.1f}",
+        "Eksport po BESS [MWh]": "{:.1f}",
+        "Praca BESS [MWh]": "{:.1f}",
+        "Redukcja peak [kW]": "{:.0f}",
+        "Korzyść roczna [PLN]": "{:,.0f}",
+        "Net cash [PLN]": "{:,.0f}",
+        "ROI [%]": "{:.1f}",
+        "Payback [lata]": "{:.1f}",
+        "IRR [%]": "{:.1f}",
+        "DSCR": "{:.2f}",
+    }),
+    use_container_width=True,
+)
+csv_pxx = pxx_df.to_csv(index=False).encode("utf-8-sig")
+st.download_button("Pobierz P90/P50/P10 do CSV", csv_pxx, "scenariusze_p90_p50_p10.csv", "text/csv")
 
 if kpi["autokonsumpcja_pct"] < 80:
     st.warning("Ten wariant nie spełnia celu minimalnej autokonsumpcji 80%. Zmniejsz PV albo zwiększ BESS.")
