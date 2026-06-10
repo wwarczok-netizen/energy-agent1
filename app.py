@@ -82,15 +82,104 @@ def load_csv(uploaded_file) -> pd.DataFrame:
     raise ValueError(f"Nie udało się odczytać CSV: {last_error}")
 
 
+
+
+def load_interval_report_excel(raw: bytes) -> pd.DataFrame:
+    """Importer raportów interwałowych XLSX typu GPZ Buk / GPZ Opalenica.
+
+    Format:
+    - osobne arkusze, np. "id 1912", "id 1964",
+    - metadane w pierwszych wierszach,
+    - wiersz z "Punkt pomiarowy: ... [1912]",
+    - dane od ok. 10 wiersza: Data | Wartość | Status danych,
+    - interwał zwykle 15 minut.
+
+    Zwraca profil zgodny z resztą aplikacji:
+    timestamp, load_kwh, ppe_id + kolumny czasu po agregacji godzinowej.
+    """
+    xls = pd.ExcelFile(io.BytesIO(raw))
+    frames = []
+
+    for sheet_name in xls.sheet_names:
+        raw_df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+        if raw_df.empty or raw_df.shape[1] < 2:
+            continue
+
+        first_rows_text = " ".join(
+            raw_df.iloc[:12, :].astype(str).fillna("").values.ravel().tolist()
+        ).lower()
+
+        # Rozpoznanie raportu interwałowego.
+        is_interval_report = (
+            "raport interwałowy" in first_rows_text
+            and "wartość" in first_rows_text
+            and ("interwał" in first_rows_text or "15 minut" in first_rows_text)
+        )
+
+        if not is_interval_report:
+            continue
+
+        # Nazwa PPE / punktu pomiarowego z metadanych.
+        ppe_name = str(sheet_name)
+        ppe_id = str(sheet_name)
+
+        for val in raw_df.iloc[:12, 0].dropna().astype(str):
+            if "Punkt pomiarowy:" in val:
+                cleaned = val.replace("Punkt pomiarowy:", "").strip()
+                ppe_name = cleaned
+                m = re.search(r"\[(.*?)\]", cleaned)
+                if m:
+                    ppe_id = m.group(1)
+                break
+
+        # Start danych: pierwszy wiersz z realną datą.
+        data_start = None
+        for idx in range(len(raw_df)):
+            parsed = pd.to_datetime(raw_df.iloc[idx, 0], errors="coerce", dayfirst=True)
+            if pd.notna(parsed):
+                data_start = idx
+                break
+
+        if data_start is None:
+            continue
+
+        part = raw_df.iloc[data_start:, [0, 1]].copy()
+        part.columns = ["timestamp", "load_kwh"]
+        part["timestamp"] = pd.to_datetime(part["timestamp"], errors="coerce", dayfirst=True)
+        part["load_kwh"] = part["load_kwh"].map(parse_number_pl)
+        part["ppe_id"] = f"{ppe_name} | {ppe_id}"
+        part = part.dropna(subset=["timestamp"]).sort_values("timestamp")
+
+        if len(part) > 0:
+            frames.append(part)
+
+    if not frames:
+        raise ValueError("To nie wygląda na raport interwałowy GPZ albo nie znaleziono danych Data/Wartość.")
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = aggregate_energy_by_hour(combined, ppe_col="ppe_id")
+    combined.attrs["importer"] = "Raport interwałowy XLSX GPZ"
+    return combined
+
+
 def load_excel(uploaded_file) -> pd.DataFrame:
     """Auto-import XLSX/XLS: czyta arkusz i normalizuje profil.
 
-    Obsługuje proste arkusze typu:
-    Data | Wolumen energii elektrycznej pobranej z sieci przed bilansowaniem godzinowym
-    oraz podobne eksporty, gdzie jedna kolumna jest datą/czasem, a druga energią.
+    Obsługuje:
+    - raporty interwałowe GPZ Buk / GPZ Opalenica z metadanymi i arkuszami "id xxxx",
+    - proste arkusze typu Data | zużycie,
+    - podobne eksporty, gdzie jedna kolumna jest datą/czasem, a druga energią.
     """
     raw = uploaded_file.getvalue()
     last_error = None
+
+    # 1) Najpierw próbujemy specjalny importer raportów interwałowych GPZ.
+    try:
+        return load_interval_report_excel(raw)
+    except Exception as e:
+        last_error = e
+
+    # 2) Potem dotychczasowy uniwersalny importer Excela.
     try:
         xls = pd.ExcelFile(io.BytesIO(raw))
         # Najpierw szukamy arkusza, który daje sensowny profil.
@@ -107,6 +196,7 @@ def load_excel(uploaded_file) -> pd.DataFrame:
                 continue
     except Exception as e:
         last_error = e
+
     raise ValueError(f"Nie udało się odczytać Excela: {last_error}")
 
 
@@ -818,7 +908,7 @@ def build_ppe_summary(profiles: Dict[str, pd.DataFrame], pv_kwp: float, annual_y
         })
     return pd.DataFrame(rows).sort_values("Zużycie [MWh]", ascending=False)
 
-st.title("Energy Agent MVP v16 — dobór PV + BESS")
+st.title("Energy Agent MVP v16.1 — dobór PV + BESS")
 st.caption("MVP: autokonsumpcja, eksport jako potencjał BESS, godzinowy model SoC magazynu, peak shaving, ROI, IRR, DSCR, SaaS/CAPEX, opłata mocowa. Bez arbitrażu cenowego.")
 
 with st.sidebar:
